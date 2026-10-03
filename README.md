@@ -1,0 +1,191 @@
+# 🔑 pi-keyrouter
+
+**API key rotation for [pi-coding-agent](https://github.com/nicobailon/pi-coding-agent).**
+
+Multiple keys per provider · automatic 429/401 fallback · native integration.
+
+```bash
+pi install npm:pi-keyrouter
+# create ~/.pi/keyrouter.json with your keys
+/reload
+```
+
+When your model returns 429 (rate-limited) or 401 (unauthorized), the next key is set via pi's native `authStorage.setRuntimeApiKey()`. pi's built-in retry then uses the new key automatically.
+
+---
+
+## ⚡ Install
+
+```bash
+pi install npm:pi-keyrouter
+```
+
+Add your provider config to `~/.pi/keyrouter.json`:
+
+```json
+{
+  "providers": [
+    {
+      "name": "z-ai",
+      "match": ["api.z.ai", "z.ai"],
+      "keys": [
+        { "name": "primary", "value": "key-1-..." },
+        { "name": "backup",  "value": "key-2-..." }
+      ]
+    }
+  ],
+  "maxRetries": 3,
+  "cooldownMs": 60000
+}
+```
+
+`/reload` — extension wraps `globalThis.fetch` and rotates on 429/401.
+
+---
+
+## 🎯 How it works (native integration)
+
+This extension uses pi's **native API key resolution** — no fetch hacks, no header manipulation.
+
+From the [pi SDK docs](https://github.com/nicobailon/pi-coding-agent):
+
+> API key resolution priority (handled by AuthStorage):
+> 1. **Runtime overrides (via `setRuntimeApiKey`, not persisted)** ← we use this
+> 2. Stored credentials in `auth.json`
+> 3. Environment variables
+> 4. Fallback resolver
+
+Flow:
+
+1. **session_start** — extension loads config, calls `authStorage.setRuntimeApiKey(provider, firstKey)` for each managed provider. Runtime override takes priority over auth.json.
+2. **Request** — pi makes the HTTP call with the runtime-overridden key.
+3. **after_provider_response (429/401/403)** — extension fires, calls `setRuntimeApiKey(provider, nextKey)`.
+4. **pi's built-in retry** — pi's retry logic (the "Retrying 3/3" you see in the UI) makes the next attempt, which now picks up the new runtime key.
+5. **Success or exhaustion** — if all keys fail, runtime override is cleared and pi surfaces the real error.
+
+### Why not fetch wrapping?
+
+An earlier version wrapped `globalThis.fetch`. It didn't work because the OpenAI SDK (used by pi-ai for z.ai and others) captures the `fetch` reference at client creation time, before extensions load. The SDK kept calling the original fetch, ignoring the wrapper.
+
+The native `setRuntimeApiKey` approach is cleaner: pi owns the HTTP layer, we only swap the key between attempts. No monkey-patching, no timing issues.
+
+### What gets rotated
+
+| Status | Action |
+|---|---|
+| 200 | Key marked OK |
+| 429 | Current key marked `rate-limited` (cooldown), `setRuntimeApiKey(nextKey)` |
+| 401 / 403 | Current key marked `unauthorized` (cooldown), `setRuntimeApiKey(nextKey)` |
+| All keys exhausted | Runtime override cleared, pi surfaces real error |
+
+---
+
+## 📊 Visibility
+
+The `/keyrouter` command shows live state:
+
+```bash
+/keyrouter
+```
+
+```
+🔑 keyrouter: active
+  z-ai (current: backup)
+    • primary  uses=12 fails=2 status=rate-limited ⏱ 47s
+    • backup   uses=2  fails=0 status=ok
+```
+
+Subcommands:
+
+- `/keyrouter status` — show snapshot (default)
+- `/keyrouter enable` — re-activate (if disabled)
+- `/keyrouter disable` — restore original fetch, stop rotating
+- `/keyrouter reload` — re-read config
+
+Every key switch notifies the user with a Box widget:
+
+> 🔑 keyrouter: z-ai — primary → backup (HTTP 429, attempt 1)
+
+---
+
+## 🔧 Config
+
+**`~/.pi/keyrouter.json` only** (user-level, never project-scoped).
+
+- Windows: `%USERPROFILE%\.pi\keyrouter.json`
+- macOS/Linux: `~/.pi/keyrouter.json`
+
+Config is global because API keys are personal credentials — they do not
+belong inside a project directory. Project-local `keyrouter.json` files are
+**deliberately ignored** (security: prevents a malicious repo from overriding
+your real keys).
+
+```json5
+{
+  "providers": [
+    {
+      "name": "display-name",          // for logs (any string)
+      "match": ["api.z.ai", "z.ai"],   // URL substrings (case-insensitive)
+      "keys": [
+        { "name": "primary", "value": "key-1..." },
+        { "name": "backup",  "value": "key-2..." }
+      ]
+    }
+  ],
+  "maxRetries": 3,         // total retries per request across all keys
+  "cooldownMs": 60000      // how long a bad key stays marked bad (1 min default)
+}
+```
+
+### Multi-provider
+
+```json
+{
+  "providers": [
+    { "name": "z-ai",       "match": ["api.z.ai"], "keys": [...] },
+    { "name": "openrouter", "match": ["openrouter.ai"], "keys": [...] }
+  ]
+}
+```
+
+Each provider rotates independently. Cross-provider URLs are not intercepted.
+
+---
+
+## 🛡️ Security
+
+API keys live in plain text in `keyrouter.json`. **Don't commit it.** Options:
+
+- Add `keyrouter.json` to `.gitignore`
+- Use `chmod 600` on the file
+- (Future) env var interpolation `$ENV_VAR` — not yet implemented
+
+---
+
+## 🛠 Development
+
+```bash
+bun test          # 33 tests
+bun run typecheck # tsc --noEmit
+```
+
+Monorepo layout:
+
+```
+packages/pi-keyrouter/
+├── index.ts          — extension entry point (native setRuntimeApiKey)
+├── rotation.ts       — pure key-pick logic
+├── config.ts         — config loader
+├── types.ts          — shared types
+└── tests/
+    ├── rotation.test.ts              — pure logic
+    ├── provider-resolution.test.ts   — provider name mapping
+    ├── config.test.ts                — config loader
+    └── smoke.test.ts                 — load-time smoke test
+```
+
+---
+
+## 📜 License
+
+MIT — same as [pi-soly](https://github.com/lowern1ght/pi-soly).
