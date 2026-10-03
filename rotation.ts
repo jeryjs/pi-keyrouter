@@ -12,15 +12,37 @@
 //    soonest (may need to wait).
 // 4. If there are no keys, return null.
 
-import type { KeyState, RotationReason } from "./types.ts";
+import type { KeyState, OAuthCredential, RotationReason } from "./types.ts";
 
-/** Build initial state from a list of key values. */
+/** Build initial state from a list of key values (API-key pools). */
 export function initKeyStates(
   keys: ReadonlyArray<{ name: string; value: string }>,
 ): KeyState[] {
   return keys.map((k) => ({
     name: k.name,
     value: k.value,
+    lastStatus: "untried",
+    cooldownUntil: 0,
+    overloadedUntil: 0,
+    uses: 0,
+    failures: 0,
+  }));
+}
+
+/**
+ * Build initial state from OAuth accounts. `value` stays empty: an OAuth pool
+ * never reads a key string, and the blob in `credential` is what gets
+ * installed. Keeping the same `KeyState` shape is what lets both pool kinds
+ * share every function below — the picker, cooldowns and diagnostics in
+ * particular — with no branching.
+ */
+export function initAccountStates(
+  accounts: ReadonlyArray<{ name: string; credential?: OAuthCredential }>,
+): KeyState[] {
+  return accounts.map((a) => ({
+    name: a.name,
+    value: "",
+    credential: a.credential,
     lastStatus: "untried",
     cooldownUntil: 0,
     overloadedUntil: 0,
@@ -49,7 +71,7 @@ export function markBad(
   cooldownMs: number,
   now: number,
 ): void {
-  state.lastStatus = reason === "rate-limited" ? "rate-limited" : "unauthorized";
+  state.lastStatus = reason;
   state.cooldownUntil = now + cooldownMs;
   state.failures += 1;
 }

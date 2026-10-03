@@ -36,8 +36,21 @@ import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync } from "node:fs";
 import { loadConfig, configPath } from "./config.ts";
-import { notifyRotation, notifyOverloaded, notifyExhausted } from "./notification.ts";
 import {
+	notifyRotation,
+	notifyOverloaded,
+	notifyExhausted,
+	notifyOAuthUnsupported,
+} from "./notification.ts";
+import {
+	captureCredential,
+	clearOverlay,
+	credentialStore,
+	installCredential,
+	type CredentialStoreApi,
+} from "./oauth.ts";
+import {
+	initAccountStates,
 	initKeyStates,
 	isAvailable,
 	markBad,
@@ -46,7 +59,14 @@ import {
 	pickNextKey,
 	recordUse,
 } from "./rotation.ts";
-import type { KeyRouterConfig, RotationEvent, KeyState } from "./types.ts";
+import type {
+	KeyRouterConfig,
+	KeyState,
+	PoolKind,
+	ProviderConfig as ProviderPoolConfig,
+	RotationEvent,
+	RotationReason,
+} from "./types.ts";
 /**
  * Optional trace sink. Set `PI_KEYROUTER_TRACE=/path/to/log` to record pool
  * decisions (key NAMES only, never values) for debugging or headless runs where
@@ -67,12 +87,33 @@ function trace(message: string): void {
  *  standard HTTP 529, and "service overloaded" variants. Case-insensitive. */
 const OVERLOADED_RE = /\boverloaded\b|\b529\b/i;
 
-/** Regex matching rate-limit style errors (key-specific failures). */
+/** Regex matching rate-limit style errors (entry-specific failures). */
 const RATE_LIMITED_RE = /\b429\b|rate.?limit|too many requests/i;
 
-/** Regex matching auth errors (key-specific failures). */
-const UNAUTHORIZED_RE = /\b40[13]\b|unauthorized|forbidden/i;
+/** Regex matching auth errors (entry-specific failures). */
+const UNAUTHORIZED_RE = /\b40[13]\b|unauthorized|forbidden|invalid_api_key/i;
 
+/**
+ * Account-level limit / billing errors.
+ *
+ * For an API-key pool these are NOT rotatable: every key belongs to the same
+ * account, so switching keys cannot lift an account-wide limit.
+ *
+ * For an OAuth pool they ARE rotatable by default (`rotateOnQuota`): each
+ * account is a separate subscription, so this is exactly the case where the
+ * next account is wanted. pi marks these non-retryable, so the rotation only
+ * takes effect through the settle-time continuation.
+ */
+const QUOTA_RE = /quota exceeded|insufficient_quota|usage limit|available balance|out of budget|billing|subscription_sharing_usage_limit_exceeded/i;
+
+/**
+ * Dead-credential errors: a refresh token that can never be redeemed.
+ *
+ * pi surfaces these as `OAuth refresh failed for <provider>: ...` (pinned by
+ * test/oauth-fixture-smoke.mjs). Only meaningful for OAuth pools — the
+ * credential itself is unusable, so the account must be rotated away from.
+ */
+const REFRESH_FAILED_RE = /OAuth refresh failed|re-?authenticate|invalid_grant|token has been revoked|refresh token/i;
 /**
  * pi's runtime credential overlay, reached through the `ModelRegistry` facade.
  *
@@ -106,20 +147,44 @@ function runtimeCredentials(
 interface ProviderRuntime {
 	/** Provider id as pi knows it (the credential-overlay key). */
 	providerId: string;
+	/** Which mechanism this pool uses. `keys` = string overlay, `oauth` = store. */
+	kind: PoolKind;
+	/**
+	 * OAuth pools: rotate on account-level quota/billing errors. Always false for
+	 * keys pools, where a quota error is account-wide and switching cannot lift it.
+	 */
+	rotateOnQuota: boolean;
+	/** Entries for both kinds: the shared rotation machinery operates on these. */
 	keys: KeyState[];
-	/** Index of the key currently in the runtime overlay. -1 = none set yet. */
+	/**
+	 * Index of the entry currently in effect.
+	 * - keys pool:  the index installed in the runtime overlay.
+	 * - oauth pool: the index installed in pi's credential store.
+	 * -1 = none set yet.
+	 */
 	currentIndex: number;
-	/** True once we have written an override for this provider. */
+	/**
+	 * True once we have written into pi for this provider.
+	 * - keys pool:  an override is installed (needs removing on shutdown).
+	 * - oauth pool: a pool account is installed in the credential store.
+	 */
 	injecting: boolean;
 	/**
+	 * OAuth pools only: the credential that was in the store when this session
+	 * started, so it can be restored on clean shutdown. `undefined` means the
+	 * provider had no stored credential, in which case shutdown leaves the pool's
+	 * active account installed rather than logging the user out.
+	 */
+	sessionStartCredential?: KeyState["credential"];
+	/**
 	 * Set after a rotation that no request has used yet. pi does not retry
-	 * 401/403, so `agent_before_settle` must ask for the one more request that
-	 * makes the swap useful. Cleared when it is consumed.
+	 * 401/403 (or quota/refresh failures), so `agent_before_settle` must ask for
+	 * the one more request that makes the swap useful. Cleared when consumed.
 	 */
 	pendingContinue: boolean;
 	/**
 	 * Continuations already requested since this provider last succeeded.
-	 * Bounds the settle-time retry: a pool whose keys are all bad would
+	 * Bounds the settle-time retry: a pool whose entries are all bad would
 	 * otherwise keep cycling through `pickNextKey`'s soonest-available branch.
 	 * Reset by any non-error assistant response.
 	 */
@@ -132,8 +197,10 @@ const CONTINUATION_CUSTOM_TYPE = "pi-keyrouter.retry";
 export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let config: KeyRouterConfig | undefined;
 	const runtimes = new Map<string, ProviderRuntime>();
-	/** Providers we set in THIS process; cleared on shutdown. */
+	/** Api-key overlays we set in THIS process; cleared on shutdown. */
 	const injected = new Set<string>();
+	/** OAuth pools that installed an account in THIS process. */
+	const installedAccounts = new Set<string>();
 	let uiCtx: ExtensionUIContext | undefined;
 	/** Providers whose config error we have already reported once. */
 	const skipReported = new Set<string>();
@@ -142,20 +209,30 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let activationNotified = false;
 	let credentialApi: RuntimeCredentialApi | undefined;
 	let credentialApiChecked = false;
+	/** pi's credential store (OAuth pools). Probed once, like the overlay API. */
+	let storeApi: CredentialStoreApi | undefined;
+	let storeApiChecked = false;
 	let lastErrorNotified = false;
+	/** Config warnings are reported once per config load. */
+	let warningsReported = false;
 
 	/**
 	 * Get-or-create the runtime for a provider, keyed by the real provider id.
+	 * Both pool kinds produce the same shape, so every downstream branch is on
+	 * `kind`, never on which config field was present.
 	 */
-	function ensureRuntime(
-		providerId: string,
-		providerCfg: { keys: ReadonlyArray<{ name: string; value: string }> },
-	): ProviderRuntime {
+	function ensureRuntime(providerId: string, providerCfg: ProviderPoolConfig): ProviderRuntime {
 		let rt = runtimes.get(providerId);
 		if (rt) return rt;
 		rt = {
 			providerId,
-			keys: initKeyStates(providerCfg.keys),
+			kind: providerCfg.kind,
+			// Only meaningful for OAuth pools; false for keys pools by construction.
+			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
+			keys:
+				providerCfg.kind === "oauth"
+					? initAccountStates(providerCfg.accounts ?? [])
+					: initKeyStates(providerCfg.keys ?? []),
 			currentIndex: -1,
 			injecting: false,
 			pendingContinue: false,
@@ -184,27 +261,60 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * One-time capability probe for pi's credential store, used by OAuth pools.
+	 * Separate from the overlay probe: a build could expose one and not the
+	 * other, and OAuth pools must stay inert without affecting API-key pools.
+	 */
+	function credentialsStore(
+		registry: ExtensionContext["modelRegistry"],
+		ui: ExtensionUIContext,
+	): CredentialStoreApi | undefined {
+		if (storeApiChecked) return storeApi;
+		storeApiChecked = true;
+		storeApi = credentialStore(registry);
+		if (!storeApi) {
+			notifyOAuthUnsupported(ui, "its credential store is not reachable through the model registry");
+		}
+		return storeApi;
+	}
+
+	/**
 	 * Why keyrouter cannot manage this provider, or undefined when it can.
-	 * `oauth` and `oauth-login` are permanent for the session; `missing` is
-	 * retried on later turns because another extension may register the
-	 * provider after us.
+	 * `oauth`, `oauth-login` and `oauth-unsupported` are permanent for the
+	 * session; `missing` is retried on later turns because another extension may
+	 * register the provider after us.
+	 *
+	 * The two pool kinds have DIFFERENT requirements, and conflating them is the
+	 * single easiest way to break this extension:
+	 *   - a `keys` pool needs `auth.apiKey`, because it installs an api_key;
+	 *   - an `oauth` pool needs `auth.oauth`, and must NOT require `auth.apiKey`
+	 *     (the OAuth-only providers, e.g. openai-codex, are precisely the ones
+	 *     whose accounts are worth pooling).
 	 */
 	function skipReason(
 		registry: ExtensionContext["modelRegistry"],
 		providerId: string,
-		allowOAuthTakeover: boolean,
-	): "missing" | "oauth" | "oauth-login" | undefined {
+		pool: ProviderPoolConfig,
+	): "missing" | "oauth" | "oauth-login" | "oauth-unsupported" | undefined {
 		const provider = registry.getProvider(providerId);
 		if (!provider) return "missing";
+
+		if (pool.kind === "oauth") {
+			// The provider must understand OAuth credentials for an installed blob to
+			// resolve at all.
+			return provider.auth?.oauth ? undefined : "oauth-unsupported";
+		}
+
 		// OAuth/subscription-only providers have no apiKey auth method; an injected
 		// api_key credential would be dropped by pi's resolver and fail the request.
 		if (!provider.auth?.apiKey) return "oauth";
 		// A provider can accept both. Injecting a runtime key shadows whatever is
 		// stored, including a signed-in OAuth token, so leave logins alone unless
 		// the pool explicitly opts in with `takeoverOAuth`.
-		if (!allowOAuthTakeover && storedCredentialIsOAuth(providerId)) return "oauth-login";
+		if (pool.takeoverOAuth !== true && storedCredentialIsOAuth(providerId)) return "oauth-login";
 		return undefined;
 	}
+
 
 	/**
 	 * True when the user has an OAuth credential stored for this provider.
@@ -220,7 +330,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	function reportSkip(providerId: string, reason: "missing" | "oauth" | "oauth-login"): void {
+	function reportSkip(
+		providerId: string,
+		reason: "missing" | "oauth" | "oauth-login" | "oauth-unsupported",
+	): void {
 		if (skipReported.has(providerId)) return;
 		skipReported.add(providerId);
 		const detail =
@@ -228,14 +341,18 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				? "provider not registered"
 				: reason === "oauth"
 					? "OAuth/subscription-only, no api-key auth"
-					: "using a stored OAuth login";
+					: reason === "oauth-unsupported"
+						? "provider has no OAuth auth method"
+						: "using a stored OAuth login";
 		trace(`skip ${providerId} (${detail})`);
 		const text =
 			reason === "missing"
 				? `🔑 keyrouter: provider "${providerId}" is not registered — check the name in ${configPath()}.`
 				: reason === "oauth"
 					? `🔑 keyrouter: "${providerId}" is OAuth/subscription-only — leaving it on pi's own login.`
-					: `🔑 keyrouter: "${providerId}" has a stored OAuth login — keeping it. Set "takeoverOAuth": true on the pool to use pooled keys instead.`;
+					: reason === "oauth-unsupported"
+						? `🔑 keyrouter: "${providerId}" has no OAuth auth method, so an account pool cannot be installed — leaving it alone.`
+						: `🔑 keyrouter: "${providerId}" has a stored OAuth login — keeping it. Set "takeoverOAuth": true on the pool to use pooled keys instead.`;
 		if (uiCtx) uiCtx.notify(text, reason === "missing" ? "warning" : "info");
 	}
 
@@ -276,6 +393,93 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		if (rt) rt.injecting = false;
 	}
 
+	// -----------------------------------------------------------------------
+	// OAuth pools: install / capture / restore through pi's credential store.
+	// keyrouter NEVER refreshes a token — pi owns refresh, and these helpers
+	// only copy blobs in and out of the store.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Install a pool account into pi's credential store.
+	 * Returns false (never throws) so a read-only store degrades instead of
+	 * failing a turn. One warning per process, like the overlay API.
+	 */
+	async function applyAccount(
+		providerId: string,
+		entry: KeyState,
+		ctx: ExtensionContext,
+	): Promise<boolean> {
+		if (!storeApi) return false;
+		const credential = entry.credential;
+		if (!credential) {
+			trace(`oauth skip ${providerId} ${entry.name} (no credential in pool entry)`);
+			return false;
+		}
+		const result = await installCredential(storeApi, providerId, credential);
+		if (!result.ok) {
+			trace(`oauth install failed ${providerId} ${entry.name} (${result.error})`);
+			if (!lastErrorNotified) {
+				lastErrorNotified = true;
+				ctx.ui.notify(
+					`🔑 keyrouter: cannot write the credential store for ${providerId} — ${result.error}. ` +
+						`OAuth pools are inert; API-key pools are unaffected.`,
+					"error",
+				);
+			}
+			return false;
+		}
+		installedAccounts.add(providerId);
+		const rt = runtimes.get(providerId);
+		if (rt) rt.injecting = true;
+		return true;
+	}
+
+	/**
+	 * Read the live credential back into the pool entry we are leaving.
+	 *
+	 * pi rotates refresh tokens in place, so a stale pool copy would install a
+	 * consumed refresh token on a later return to that account — burning an
+	 * account that was perfectly healthy. This is why capture happens both before
+	 * swapping away and after installing.
+	 */
+	async function captureAccount(providerId: string, entry: KeyState | undefined): Promise<void> {
+		if (!storeApi || !entry) return;
+		const live = await captureCredential(storeApi, providerId);
+		if (live) entry.credential = live;
+	}
+
+	/**
+	 * Hand the provider back to whatever it had before this session started.
+	 *
+	 * Only a credential that was actually present at session start is restored.
+	 * If there was none, leaving the active pool account installed is the
+	 * friendlier outcome: it is a valid login, and logging the user out would
+	 * turn a clean shutdown into a broken one.
+	 */
+	async function restoreSessionStartAccount(
+		providerId: string,
+		rt: ProviderRuntime,
+	): Promise<void> {
+		if (!storeApi) return;
+		const active = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
+		// Preserve pi's refreshed tokens for the account we are leaving.
+		await captureAccount(providerId, active);
+
+		const original = rt.sessionStartCredential;
+		if (!original) {
+			trace(`oauth restore ${providerId} (no session-start credential; leaving ${active?.name ?? "(none)"} installed)`);
+			return;
+		}
+		const result = await installCredential(storeApi, providerId, original);
+		if (result.ok) {
+			trace(`oauth restore ${providerId} -> session-start credential`);
+		} else {
+			trace(`oauth restore failed ${providerId} (${result.error})`);
+		}
+		installedAccounts.delete(providerId);
+		rt.injecting = false;
+	}
+
 	/**
 	 * Activate the router: load config (once), bootstrap all providers, and set
 	 * the first key of each pool. Idempotent — safe on every before_agent_start.
@@ -288,25 +492,70 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		if (config.providers.length === 0) return;
 		uiCtx = ctx.ui;
 
-		if (!credentialsApi(ctx.modelRegistry, ctx.ui)) return;
+		// Report config warnings once (dropped accounts, mutually exclusive fields).
+		if (!warningsReported && config.warnings && config.warnings.length > 0) {
+			warningsReported = true;
+			for (const w of config.warnings) trace(`config warning ${w}`);
+			ctx.ui.notify(`🔑 keyrouter: config\n  ${config.warnings.join("\n  ")}`, "warning");
+		}
+
+		// Capability probes. Each pool kind degrades independently: a build without
+		// the credential store must still rotate API keys, and vice versa.
+		const hasOverlay = credentialsApi(ctx.modelRegistry, ctx.ui) !== undefined;
+		const hasStore = credentialsStore(ctx.modelRegistry, ctx.ui) !== undefined;
 
 		let newlyBootstrapped = 0;
+		let accounted = 0;
 		for (const p of config.providers) {
 			const providerId = resolveProviderId(ctx.modelRegistry, p.name);
 			// Skip providers we've already bootstrapped or permanently rejected
 			if (runtimes.has(providerId) || permanentSkip.has(providerId)) continue;
-			const reason = skipReason(ctx.modelRegistry, providerId, p.takeoverOAuth === true);
+			const reason = skipReason(ctx.modelRegistry, providerId, p);
 			if (reason) {
 				if (reason !== "missing") permanentSkip.add(providerId);
 				reportSkip(providerId, reason);
 				continue;
 			}
+			// Capability gate per kind. Reported once by the probe helpers.
+			if (p.kind === "oauth" ? !hasStore : !hasOverlay) continue;
+
 			const rt = ensureRuntime(providerId, p);
 			if (rt.currentIndex >= 0 || rt.keys.length === 0) continue;
+
+			// An OAuth pool must never leave an api_key overlay in place: on an
+			// OAuth-only provider it would make auth resolve to NOTHING, and on a
+			// dual-auth provider it would freeze the token so pi never refreshes it.
+			// A leftover override from an earlier `keys` configuration is the one way
+			// this could happen.
+			if (p.kind === "oauth") {
+				await clearOverlay(credentialApi?.removeRuntimeApiKey.bind(credentialApi), providerId);
+				injected.delete(providerId);
+			}
+
 			const idx = pickNextKey(rt.keys, 0, Date.now());
 			if (idx < 0) continue;
 			const key = rt.keys[idx];
 			if (!key) continue;
+
+			if (p.kind === "oauth") {
+				// Remember what the provider had before us, so a clean shutdown can put
+				// it back. Read-only, best effort — a read failure just means we treat
+				// it as "no stored credential".
+				rt.sessionStartCredential = storeApi
+					? await captureCredential(storeApi, providerId)
+					: undefined;
+				rt.currentIndex = idx;
+				recordUse(key);
+				if (await applyAccount(providerId, key, ctx)) {
+					// Capture again: pi may have merged or normalized the blob, and this is
+					// the copy a later return to this account will install.
+					await captureAccount(providerId, key);
+					accounted++;
+					trace(`oauth install ${providerId} -> ${key.name} (${rt.keys.length} account(s))`);
+				}
+				continue;
+			}
+
 			rt.currentIndex = idx;
 			recordUse(key);
 			// This is the fix for the old bug: the initial key actually gets set.
@@ -315,11 +564,16 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				trace(`bootstrap ${providerId} -> ${key.name}`);
 			}
 		}
-		// Only notify on first activation (when we bootstrapped at least one)
-		if (newlyBootstrapped > 0 && !activationNotified) {
+		// Only notify on first activation (when we installed anything)
+		if ((newlyBootstrapped > 0 || accounted > 0) && !activationNotified) {
 			activationNotified = true;
+			const totalKeys = config.providers.reduce((a, p) => a + (p.keys?.length ?? 0), 0);
+			const totalAccounts = config.providers.reduce((a, p) => a + (p.accounts?.length ?? 0), 0);
+			const parts: string[] = [];
+			if (totalKeys > 0) parts.push(`${totalKeys} key(s)`);
+			if (totalAccounts > 0) parts.push(`${totalAccounts} account(s)`);
 			ctx.ui.notify(
-				`🔑 keyrouter: active (${config.providers.length} provider(s), ${config.providers.reduce((a, p) => a + p.keys.length, 0)} keys)`,
+				`🔑 keyrouter: active (${config.providers.length} provider(s), ${parts.join(", ")})`,
 				"info",
 			);
 		}
@@ -388,8 +642,19 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Rotation branch: 429 (key-rate-limited) or 401/403 (key-bad).
-		let reason: "rate-limited" | "unauthorized" | null = null;
+		// Rotation branch. Classification is kind-aware, because the two pool kinds
+		// treat an account-level limit in OPPOSITE ways:
+		//
+		//   429 / rate limit       both: entry-specific, rotate.
+		//   401 / 403 / bad key   both: entry-specific, rotate.
+		//   quota / billing        keys: NEVER rotate (every key is the same
+		//                                 account, so switching cannot lift an
+		//                                 account-wide limit).
+		//                          oauth: rotate when rotateOnQuota (default true)
+		//                                 — each account is its own subscription.
+		//   refresh failed         oauth only: the credential itself is dead.
+		//   overload / 5xx         neither: handled above / ignored below.
+		let reason: RotationReason | null = null;
 		let status = 0;
 		if (RATE_LIMITED_RE.test(errMsg)) {
 			reason = "rate-limited";
@@ -397,47 +662,76 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		} else if (UNAUTHORIZED_RE.test(errMsg)) {
 			reason = "unauthorized";
 			status = errMsg.includes("401") ? 401 : 403;
+		} else if (rt.kind === "oauth" && REFRESH_FAILED_RE.test(errMsg)) {
+			reason = "refresh-failed";
+			status = 401;
+		} else if (rt.kind === "oauth" && rt.rotateOnQuota && QUOTA_RE.test(errMsg)) {
+			reason = "quota";
+			status = 402;
 		}
 		if (!reason) {
-			// Not a key problem (billing/quota/unknown): leave the key in place and
-			// let pi surface the error rather than burning the whole pool.
+			// Not an entry problem: leave the pool alone and let pi surface the error
+			// rather than burning every credential we hold.
 			trace(`ignore ${providerId} (non-rotatable error: ${errMsg.slice(0, 120)})`);
 			return;
 		}
 
-		// Mark current key as bad
+		// Mark the entry we are leaving as bad.
 		const currentKey = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
 		if (currentKey) {
 			markBad(currentKey, reason, config.cooldownMs, Date.now());
 		}
 
-		// Find next available key (different from current)
+		// Find the next available entry (different from the current one).
 		const nextIdx = pickNextKey(rt.keys, rt.currentIndex + 1, Date.now());
 		if (nextIdx < 0 || nextIdx === rt.currentIndex) {
-			// All keys exhausted — clear our override so pi falls back to the
-			// user's own credential, then let pi surface the real error.
+			// Everything is exhausted.
 			const failed = rt.keys.filter((k) => k.failures > 0).map((k) => k.name);
-			if (rt.injecting) await clearKey(providerId);
-			trace(`exhausted ${providerId} failed=[${failed.join(", ")}]`);
-			if (uiCtx) notifyExhausted(uiCtx, providerId, failed);
+			if (rt.kind === "oauth") {
+				// Leave the active account installed: it is still a valid login, and
+				// logging the user out mid-session helps nobody. pi surfaces the error.
+				trace(`exhausted ${providerId} accounts=[${failed.join(", ")}]`);
+			} else {
+				// Keys pool: drop the override so pi falls back to the user's own
+				// credential, then let pi surface the real error.
+				if (rt.injecting) await clearKey(providerId);
+				trace(`exhausted ${providerId} failed=[${failed.join(", ")}]`);
+			}
+			if (uiCtx) notifyExhausted(uiCtx, providerId, failed, rt.kind);
 			return;
 		}
 
 		const nextKey = rt.keys[nextIdx];
 		if (!nextKey) return;
-
-		// Set the new runtime key. pi retries 429/5xx itself, so that retry already
-		// picks the new key up. For errors pi does NOT retry (401/403), the flag
-		// lets `agent_before_settle` ask for the one request that uses it.
-		// Only ask when the picked key is genuinely available: `pickNextKey`
-		// returns the soonest-to-clear key even while cooled, and retrying into
-		// another cooldown is not worth an extra request.
-		if (!(await applyKey(providerId, nextKey.value, ctx))) return;
 		const previousName = currentKey?.name ?? "(none)";
-		rt.currentIndex = nextIdx;
-		recordUse(nextKey);
-		rt.pendingContinue = isAvailable(nextKey, Date.now());
-		trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
+
+		// Whether pi will retry this error class itself. 429 is retryable; 401/403
+		// and quota/refresh failures are not, so those need the settle-time
+		// continuation to ever use the credential we are about to install.
+		// Only ask when the picked entry is genuinely available: `pickNextKey`
+		// returns the soonest-to-clear entry even while cooled, and retrying into
+		// another cooldown is not worth an extra request.
+		const wantsContinue = isAvailable(nextKey, Date.now());
+
+		if (rt.kind === "oauth") {
+			// 1. Preserve whatever pi refreshed for the account we are leaving.
+			await captureAccount(providerId, currentKey);
+			// 2. Install the next account.
+			if (!(await applyAccount(providerId, nextKey, ctx))) return;
+			rt.currentIndex = nextIdx;
+			recordUse(nextKey);
+			// 3. Read it back: pi may normalize or merge the blob, and this copy is
+			//    what a later return to this account will install.
+			await captureAccount(providerId, nextKey);
+			rt.pendingContinue = wantsContinue;
+			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
+		} else {
+			if (!(await applyKey(providerId, nextKey.value, ctx))) return;
+			rt.currentIndex = nextIdx;
+			recordUse(nextKey);
+			rt.pendingContinue = wantsContinue;
+			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
+		}
 
 		// Notify with a single themeable line (falls back silently without UI)
 		if (uiCtx) {
@@ -490,21 +784,33 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
-		// Runtime overrides are not persisted, but this process may be reloaded
-		// rather than exited, so drop them explicitly. pi restores whatever the
-		// user had configured (auth.json key, env var, or OAuth credential).
+		// Everything keyrouter wrote is a change to pi's live state, so undo it
+		// explicitly — this process may be reloaded rather than exited.
+		//
+		//   keys pool:  drop the runtime override. Not persisted, so removal alone
+		//              restores the user's own key/env/OAuth credential.
+		//   oauth pool: restore the credential that was stored at session start, so
+		//              pi is left exactly as keyrouter found it.
 		if (credentialApi) {
 			for (const providerId of [...injected]) await clearKey(providerId);
 		}
+		for (const providerId of [...installedAccounts]) {
+			const rt = runtimes.get(providerId);
+			if (rt) await restoreSessionStartAccount(providerId, rt);
+		}
 		injected.clear();
+		installedAccounts.clear();
 		runtimes.clear();
 		skipReported.clear();
 		permanentSkip.clear();
 		config = undefined;
 		uiCtx = undefined;
 		activationNotified = false;
+		warningsReported = false;
 		credentialApi = undefined;
 		credentialApiChecked = false;
+		storeApi = undefined;
+		storeApiChecked = false;
 		lastErrorNotified = false;
 	});
 
@@ -536,17 +842,36 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				const lines: string[] = [`🔑 keyrouter: active`];
 				for (const [providerId, rt] of runtimes) {
 					const current = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
+					// `source` is pi's own vocabulary (runtime / stored / environment).
+					// "runtime" is the only reliable signal that an api_key overlay is
+					// installed, and it tells the two pool kinds apart at a glance.
 					const auth = ctx.modelRegistry.getProviderAuthStatus(providerId);
+					const installed = rt.kind === "oauth" ? rt.injecting : auth.source === "runtime";
 					lines.push("");
 					lines.push(
-						`  ${providerId} (current: ${current?.name ?? "(none)"}, ` +
-							`override: ${rt.injecting ? "on" : "off"}, configured: ${auth.configured ? "yes" : "no"})`,
+						`  ${providerId} (${rt.kind}, active: ${current?.name ?? "(none)"}, ` +
+							`installed: ${installed ? "yes" : "no"}, source: ${auth.source ?? "none"})`,
 					);
 					for (const k of rt.keys) {
 						const marker = k === current ? "→" : "•";
 						const avail = isAvailable(k, Date.now()) ? "" : " (cooldown)";
+						// Show when the credential expires, never the token itself. OAuth
+						// pools only — an API-key pool has no `expires` to report.
+						let expiry = "";
+						if (rt.kind === "oauth") {
+							const expires = k.credential?.expires;
+							if (typeof expires === "number") {
+								const ms = expires - Date.now();
+								expiry =
+									ms <= 0
+										? " expires=expired"
+										: ` expires=in ${Math.max(1, Math.round(ms / 60_000))}m`;
+							} else {
+								expiry = " expires=unknown";
+							}
+						}
 						lines.push(
-							`    ${marker} ${k.name}  uses=${k.uses} fails=${k.failures} status=${k.lastStatus}${avail}`,
+							`    ${marker} ${k.name}  uses=${k.uses} fails=${k.failures} status=${k.lastStatus}${avail}${expiry}`,
 						);
 					}
 				}
@@ -557,14 +882,22 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				if (credentialApi) {
 					for (const providerId of [...injected]) await clearKey(providerId);
 				}
+				for (const providerId of [...installedAccounts]) {
+					const rt = runtimes.get(providerId);
+					if (rt) await restoreSessionStartAccount(providerId, rt);
+				}
 				injected.clear();
+				installedAccounts.clear();
 				config = loadConfig(ctx.cwd);
 				runtimes.clear();
 				skipReported.clear();
 				permanentSkip.clear();
 				activationNotified = false;
+				warningsReported = false;
 				credentialApiChecked = false;
 				credentialApi = undefined;
+				storeApiChecked = false;
+				storeApi = undefined;
 				lastErrorNotified = false;
 				await activate(ctx);
 				ctx.ui.notify(
@@ -574,13 +907,18 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (sub === "reset") {
-				// Hand every provider back to pi's own auth. Stays off until the
-				// next turn re-activates the pools.
+				// Hand every provider back to pi's own auth. Stays off until the next
+				// turn re-activates the pools.
 				if (credentialApi) {
 					for (const providerId of [...injected]) await clearKey(providerId);
 				}
+				for (const providerId of [...installedAccounts]) {
+					const rt = runtimes.get(providerId);
+					if (rt) await restoreSessionStartAccount(providerId, rt);
+				}
 				for (const rt of runtimes.values()) rt.currentIndex = -1;
 				injected.clear();
+				installedAccounts.clear();
 				activationNotified = false;
 				ctx.ui.notify(
 					runtimes.size > 0
@@ -594,6 +932,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		},
 	});
 }
+
 
 /** Provider id recorded on an assistant message (the physical provider). */
 function messageProviderId(msg: { provider?: string }): string | undefined {

@@ -1,12 +1,24 @@
 {
   "name": "pi-keyrouter",
   "version": "1.0.0",
-  "description": "API key pools for pi. Rotates keys inside providers you already have (built-in, models.json, or another extension's) on 429/401/403. Never registers its own provider; pi keeps auth, OAuth and retries.",
+  "author": {
+    "name": "jeryjs",
+    "url": "https://github.com/jeryjs"
+  },
+  "contributors": [
+    {
+      "name": "lowern1ght",
+      "url": "https://github.com/lowern1ght"
+    }
+  ],
+  "description": "Credential pools for pi. Rotates API keys or stored OAuth logins inside providers you already have (built-in, models.json, or another extension's) on 429/401/403 and quota errors. Never registers its own provider; pi keeps auth, OAuth refresh and retries.",
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "test": "node test/fake-openai-server.mjs --selftest && node test/run.mjs",
+    "test": "node test/fake-openai-server.mjs --selftest && node test/unit-oauth.mjs && node test/run.mjs",
     "test:e2e": "node test/run.mjs",
+    "test:unit": "node test/unit-oauth.mjs",
+    "test:probe": "node test/verify-runtime-credentials.mjs",
     "typecheck": "bun x tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {},
@@ -27,6 +39,7 @@
     "README.md",
     "index.ts",
     "config.ts",
+    "oauth.ts",
     "rotation.ts",
     "notification.ts",
     "types.ts",
@@ -37,8 +50,10 @@
     "pi-extension",
     "pi-package",
     "api-key",
+    "oauth",
     "key-rotation",
-    "rate-limit",
+    "account-rotation",
+    "credential-pool",
     "fallback",
     "ai-coding"
   ],
@@ -51,13 +66,13 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
-  "homepage": "https://github.com/lowern1ght/pi-soly#readme",
+  "homepage": "https://github.com/jeryjs/pi-keyrouter#readme",
   "bugs": {
-    "url": "https://github.com/lowern1ght/pi-soly/issues"
+    "url": "https://github.com/jeryjs/pi-keyrouter/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/lowern1ght/pi-soly.git",
+    "url": "https://github.com/jeryjs/pi-keyrouter.git",
     "directory": "packages/pi-keyrouter"
   }
 }

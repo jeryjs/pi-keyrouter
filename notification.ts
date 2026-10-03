@@ -56,19 +56,39 @@ export function notifyOverloaded(
 }
 
 /**
- * Notify that all keys of a provider have been exhausted.
+ * Notify that all entries of a pool have been exhausted.
  * Kept on the same path as the other notifications so the user sees
- * one consistent surface.
+ * one consistent surface. `kind` only changes the wording — `accounts` for
+ * OAuth pools, `keys` for API-key pools.
  */
 export function notifyExhausted(
 	ui: ExtensionUIContext,
 	provider: string,
 	failedKeys: ReadonlyArray<string>,
+	kind: "keys" | "oauth" = "keys",
 ): void {
 	const list = failedKeys.length > 0 ? failedKeys.join(", ") : "(none)";
-	const text = `🔑 keyrouter: ${provider} — all keys exhausted (${list}). Surfacing original error.`;
+	const noun = kind === "oauth" ? "accounts" : "keys";
+	const text = `🔑 keyrouter: ${provider} — all ${noun} exhausted (${list}). Surfacing original error.`;
 	try {
 		ui.notify(text, "error");
+	} catch {
+		// silent
+	}
+}
+
+/**
+ * One-time notice that a credential-store capability is missing, so OAuth
+ * pools are inert while API-key pools keep working. Kept distinct from the
+ * generic inactive notice because the remedies differ.
+ */
+export function notifyOAuthUnsupported(ui: ExtensionUIContext, detail: string): void {
+	try {
+		ui.notify(
+			`🔑 keyrouter: OAuth account pools are unavailable in this pi build — ${detail}. ` +
+				`API-key pools are unaffected.`,
+			"warning",
+		);
 	} catch {
 		// silent
 	}

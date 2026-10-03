@@ -1,13 +1,24 @@
 # Handoff: OAuth account pools for pi-keyrouter
 
+> **STATUS: IMPLEMENTED.** This document is now the design record rather than a to-do list.
+> All 8 steps in §6 are complete: `accounts` pools rotate between stored OAuth logins, all 12 OAuth
+> cases and the 16 original API-key cases pass (**27/27**), `tsc` is clean, and the suite proves the
+> real `~/.pi/agent/auth.json` is byte-identical before and after. See §11 for what implementation
+> changed relative to this plan — three things in §3 turned out to be wrong, and one design detail
+> (§4.6 restore semantics) needed adjusting.
+
 **Deliverable:** pi-keyrouter rotates between multiple stored OAuth accounts for a provider, on the
 same signals that already rotate API keys, while leaving token refresh 100% owned by pi.
 
-**Repo:** `Y:\All-Projects\pi\pi-keyrouter` (branch `main`, clean, HEAD `59b0502`)
+**Repo:** `Y:\All-Projects\pi\pi-keyrouter` (branch `main`)
 
-**Read this whole document before writing code.** Everything under "Verified reference" was read from
-the installed pi 1.0.0 during design. Everything under "To verify" is a guess that the agent must
-confirm with a probe before relying on it.
+**Read this whole document before changing the OAuth path.** Everything under "Verified reference"
+was read from the installed pi 1.0.0 during design and later re-confirmed by
+`test/verify-runtime-credentials.mjs`.
+
+---
+
+## 1. Mission and success criteria
 
 ---
 
@@ -326,22 +337,37 @@ look inside.
 
 ---
 
-## 3. To verify (probe first, do not assume)
+## 3. Answers (probed at implementation time)
 
-1. `AuthStorage.create(...)` signature (`model-runtime.js:79` calls `DefaultAuthStorage.create(options.authPath)`).
-2. Whether `registry.refresh({ providers: [id], allowNetwork: false })` promptly updates
-   `getProviderAuthStatus(id).source` to `"stored"` after a store write. Cosmetic only; do not block on
-   it, but note the result.
-3. The exact wrapper behind `agent-session`'s `_isRetryableError` (assumed to delegate to
-   `isRetryableAssistantError`).
-4. The tail of `emitBoundary()` after the handler loop (lines past `runner.js:775`): whether `context`
-   and `valid` are recomputed between handlers.
-5. That a `custom_message` draft plus `continue: true` still produces exactly one extra request for an
-   **OAuth** pool (already proven for API-key pools; re-confirm, since it is the mechanism the
-   non-retryable classes depend on).
+All five questions were answered by `test/verify-runtime-credentials.mjs`, which is kept in the repo
+as the executable record. Run it with `PI_PKG_ROOT` set to the pi package root for the
+`ReadOnlyAuthStorage` case.
 
-Write probes as standalone scripts under `test/`, run them, and record the answers in the final
-report. Pattern to copy: `test/verify-runtime-keys.mjs`.
+| # | Question | Answer |
+|---|---|---|
+| 1 | `AuthStorage.create()` signature | `static create(authPath = join(getAgentDir(), "auth.json"))` — confirmed at `auth-storage.js:282`. No behaviour depended on it. |
+| 2 | Does `refresh()` update `authStatus.source`? | **Not needed.** Reading `getAuth()` after `modify()` reflects the write immediately. `getProviderAuthStatus()` is used for display only. |
+| 3 | What wraps `_isRetryableError`? | Confirmed: `agent-session.js:2944` → `isRetryableAssistantError(message)`. The retry table in §2.5 holds as written. |
+| 4 | End of `emitBoundary()` | Confirmed (`runner.js:797`): returns `{entries, continue, context, valid}`; **`valid: false` discards all entries** (`entries: []`, `continue: false`). Handlers returning invalid drafts therefore cannot corrupt the transcript, but a handler that returns a bad draft also silently loses its continuation. |
+| 5 | Does a `custom_message` draft still buy one extra request for an OAuth pool? | Yes — proven by `oauth-rotate-on-401` and `oauth-rotate-on-account-quota`, which each assert exactly one continuation and a second request carrying the next account. |
+
+### Three corrections to §2
+
+1. **`getAuth().source` and `getProviderAuthStatus().source` use different vocabularies.** `getAuth()`
+   says `"OAuth"`; `getProviderAuthStatus()` says `"stored"`. Both say `"runtime"` for an overlay.
+   Comparing one enum against the other is a silent bug — the probe asserts both spellings.
+2. **A resolved OAuth credential can legitimately carry `auth.apiKey`.** pi calls the provider's
+   `oauth.toAuth(credential)`, and e.g. `openai-codex` turns its blob into a bearer string. So
+   "does `auth.apiKey` exist?" proves nothing about whether an overlay is installed; `source` is the
+   only trustworthy discriminator. (An earlier draft of this document got this wrong.)
+3. **§2.1's claim is stronger than stated.** The probe confirms it directly against pi 1.0.0: with
+   an api_key overlay installed on the OAuth-only provider `openai-codex`, `getProviderAuthStatus()`
+   reports `source=runtime` (looks configured) while `getAuth()` resolves to **`undefined`** — no auth
+   at all. That asymmetry is the entire reason OAuth pools must not use the overlay.
+
+Built-in auth shapes for reference (from `@earendil-works/pi-ai/providers/all`): **42** providers, of
+which `openai-codex` is the only OAuth-only one; the dual-auth set is `anthropic`, `github-copilot`,
+`kimi-coding`, `meta`, `openai`, `openrouter`, `radius`, `xai`.
 
 ---
 
@@ -812,3 +838,77 @@ pi internals (read-only reference; exact paths in section 2):
    automatic rotation? Cheap to add; not required by the success criteria.
 3. Should `keys` and `accounts` be combinable for one provider (single pool mixing api keys and OAuth
    accounts)? The current design rejects it; mixing is easy later if wanted.
+
+---
+
+## 11. Implementation report
+
+### Files
+
+| File | Change |
+|---|---|
+| `types.ts` | Added `OAuthCredential` (opaque, index-signature), `AccountEntry`, `PoolKind`, `KeyStatus`; `ProviderConfig` gained `accounts`/`kind`/`rotateOnQuota` and made `keys` optional; `KeyState` gained `credential?`; `RotationReason` gained `quota`/`refresh-failed`. |
+| `config.ts` | Added `parseAccountCredential` (`@file` / `$ENV` JSON / inline), `validateCredential`, account normalization, `keys`+`accounts` mutual exclusion, and `warnings` (which never contain a credential value). |
+| `oauth.ts` | **New.** `credentialStore` (capability-guarded facade access), `isOAuthCredential`, `installCredential`, `captureCredential`, `hasStoredOAuthLogin`, `clearOverlay`. |
+| `rotation.ts` | Added `initAccountStates`; `markBad` now records the reason verbatim. Everything else shared unchanged. |
+| `notification.ts` | `notifyExhausted` takes a pool kind for wording; added `notifyOAuthUnsupported`. |
+| `index.ts` | Kind-aware `ProviderRuntime`, `skipReason`, activation/install/capture/restore, the OAuth rotation branch, kind-aware classification, status output. The `keys` path is behaviourally unchanged. |
+| `test/oauth-cases.mjs` | **New.** 12 cases. |
+| `test/fixture/oauth-provider.ts` | **New.** OAuth-only `kroauth` provider; models refresh-token rotation. |
+| `test/unit-oauth.mjs` | **New.** 46 unit checks, no pi/server needed. |
+| `test/verify-runtime-credentials.mjs` | **New.** Probes pi's credential store; answer record for §3. |
+| `test/oauth-fixture-smoke.mjs` | **New.** Proves the fixture works *without* keyrouter. |
+| `test/run.mjs` | OAuth plumbing, `byKey`/`sequence` reuse, OS-assigned free port, real-auth.json checksum guard. |
+
+### Results
+
+```
+bun x tsc --noEmit -p tsconfig.json      clean
+node test/fake-openai-server.mjs --selftest   all plan cases pass
+node test/unit-oauth.mjs                 46/46
+node test/verify-runtime-credentials.mjs all credential-store probes pass
+node test/oauth-fixture-smoke.mjs        all checks pass
+node test/run.mjs                        27/27   (16 API-key + 1 existing OAuth + 10 new OAuth)
+real auth.json                           unchanged (sha256 8f73695a…)
+```
+
+Also verified against the real user config: all three pools bootstrapped (`tokenharbor`,
+`google`, `openrouter`), the request authenticated with the pooled key, a 404 model error was
+correctly **not** rotated, and every override was cleared on shutdown.
+
+### Deviations from this plan
+
+1. **The OAuth path went into `index.ts` rather than a new rotation module.** §4.4 proposed keeping
+   `oauth.ts` for store access only, which is what happened — the helpers (`applyAccount`,
+   `captureAccount`, `restoreSessionStartAccount`) live beside `applyKey`/`clearKey` in `index.ts`
+   so the two pool kinds sit side by side and the `keys` path stays readable.
+2. **Credential types are structurally typed, not imported from pi-ai.** `@earendil-works/pi-ai`
+   is a peer dependency that does not resolve from the extension's own node_modules
+   (`ERR_PACKAGE_PATH_NOT_EXPORTED`). Reaching into it would also break under pi's bundler, so
+   `OAuthCredential` is a local structural type with an index signature and every store call is
+   capability-checked. The blob stays opaque, which is what the eight differently-shaped built-in
+   providers need.
+3. **§4.6's restore semantics needed one adjustment.** "Restore the session-start credential" is only
+   correct when there *was* one. If the provider had no stored credential, keyrouter leaves the
+   active pool account installed rather than logging the user out — it is still a valid login, and
+   the next session installs account #1 again. Traces say which branch was taken.
+4. **`rotateOnQuota` is per-pool, not global**, and is forced `false` for `keys` pools by
+   construction (the field is only set for `accounts` pools), so the two kinds cannot drift.
+
+### Two testing traps worth remembering
+
+1. **A credential seeded into `auth.json` never runs.** keyrouter installs account #1 at session
+   start, replacing it before the first request. Two cases failed on this before the special
+   credentials (near-expiry, dead refresh token) were moved into the pool *config*, where keyrouter
+   installs from. If a future test needs a specific stored credential, it must be a pool entry.
+2. **A fixture that accepts a reused refresh token cannot detect a lost rotation.** The fixture now
+   consumes refresh tokens like a real provider, so a pool that failed to sync pi's rotated blob
+   back fails with `invalid_grant` instead of silently succeeding. That turned
+   `oauth-pi-refreshes-and-keyrouter-syncs-back` into a real assertion: the pool returns to account
+   #1 and re-installs pi's **rotated** credential, with pi refreshing exactly once.
+
+### Still open
+
+§10 stands: `rotateOnQuota` defaults to `true` for `accounts` pools (confirm), and a manual
+`/keyrouter account <provider> <name>` selector plus mixed `keys`+`accounts` pools remain
+unimplemented because nothing in the success criteria needs them.

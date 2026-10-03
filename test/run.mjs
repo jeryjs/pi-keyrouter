@@ -24,8 +24,11 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { OAUTH_ACCOUNTS, OAUTH_ACCOUNTS_3, OAUTH_ACCOUNTS_DEAD_FIRST, OAUTH_ACCOUNTS_EXPIRING_FIRST, oauthCases } from "./oauth-cases.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -37,6 +40,52 @@ const ARTIFACTS = join(HERE, "artifacts");
 const TRACE = join(ARTIFACTS, "trace.log");
 const SERVER_LOG = join(ARTIFACTS, "server.log");
 const EXTENSION_ENTRY = join(ROOT, "index.ts");
+/** The OAuth-only fixture provider, loaded in addition to the extension. */
+const OAUTH_PROVIDER = join(HERE, "fixture", "oauth-provider.ts");
+/** Written by the fixture's refreshToken hook ("did pi refresh, and when"). */
+const OAUTH_LOG = join(ARTIFACTS, "oauth.log");
+/** The REAL user auth.json. The suite asserts this is byte-identical. */
+const REAL_AUTH_JSON = join(homedir(), ".pi", "agent", "auth.json");
+
+/** Extra pi CLI options for OAuth cases. */
+const OAUTH_RUN_OPTS = {
+	extensions: [OAUTH_PROVIDER],
+	provider: "kroauth",
+	env: { KR_OAUTH_LOG: OAUTH_LOG },
+};
+
+/**
+ * Read the fixture's oauth log, if the case produced one.
+ * Lines are "<iso> refresh access=..."; timestamps are stripped so assertions
+ * match on content.
+ */
+function readOauthLog() {
+	if (!existsSync(OAUTH_LOG)) return [];
+	return readFileSync(OAUTH_LOG, "utf8")
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => line.replace(/^\S+\s+/, "").trim());
+}
+
+/** Parse the fixture agent dir's auth.json after a run. */
+function readAuthJson() {
+	const path = join(AGENT_DIR, "auth.json");
+	if (!existsSync(path)) return undefined;
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * sha256 of a file, or "(absent)". Used to prove the suite never touches the
+ * user's real credentials — every case runs in the fixture agent dir.
+ */
+function fileDigest(path) {
+	if (!existsSync(path)) return "(absent)";
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
 
 // How to launch pi: Node cannot spawn the `pi.ps1`/`pi.cmd` shims on Windows,
 // so prefer pi's own bundle entry through this Node binary. Resolution order:
@@ -58,15 +107,26 @@ function resolvePiCli() {
 		return undefined;
 	}
 }
-// Random port by default: a leftover server from an older checkout would
-// otherwise answer our requests and silently skew every case. The build marker
-// below is the second line of defence when KR_TEST_PORT is pinned.
-const PORT = Number(process.env.KR_TEST_PORT ?? randomPort());
+// Ask the OS for a genuinely free ephemeral port. A random guess in a fixed
+// range intermittently lands on a Windows excluded/reserved port, which fails
+// as EACCES ("permission denied") rather than EADDRINUSE and looks like a
+// mysterious server crash. Binding port 0 cannot collide.
+const PORT = Number(process.env.KR_TEST_PORT ?? (await freePort()));
 const BASE = `http://127.0.0.1:${PORT}`;
 const SERVER_BUILD = "kr-fake-v2";
 
-function randomPort() {
-	return 41000 + Math.floor(Math.random() * 18000);
+async function freePort() {
+	const { createServer } = await import("node:net");
+	return await new Promise((resolve, reject) => {
+		const probe = createServer();
+		probe.unref();
+		probe.on("error", reject);
+		probe.listen(0, "127.0.0.1", () => {
+			const address = probe.address();
+			const port = typeof address === "object" && address ? address.port : 0;
+			probe.close(() => (port ? resolve(port) : reject(new Error("no free port"))));
+		});
+	});
 }
 const PI_TIMEOUT_MS = Number(process.env.KR_TEST_TIMEOUT ?? 120_000);
 const BASELINE_KEY = "sk-models-json-baseline";
@@ -81,6 +141,14 @@ const filters = argv.filter((a) => !a.startsWith("--"));
 // ---------------------------------------------------------------------------
 const POOL = (...keys) => ({
 	providers: [{ name: "krtest", keys: keys.map(([name, value]) => ({ name, value })) }],
+	maxRetries: 3,
+	cooldownMs: 60_000,
+	overloadedCooldownMs: 30_000,
+});
+
+/** An OAuth account pool for `kroauth`, the OAuth-only fixture provider. */
+const ACCOUNTS = (accounts, extra = {}) => ({
+	providers: [{ name: "kroauth", accounts, ...extra }],
 	maxRetries: 3,
 	cooldownMs: 60_000,
 	overloadedCooldownMs: 30_000,
@@ -116,6 +184,22 @@ const CONFIGS = {
 			{ name: "uses-missing-var", keys: [{ name: "M", value: "$KR_TEST_DEFINITELY_NOT_SET" }] },
 		],
 	},
+
+	// --- OAuth account pools (provider `kroauth`, OAuth-only) ----------------
+	accounts: ACCOUNTS(OAUTH_ACCOUNTS),
+	"accounts-3": ACCOUNTS(OAUTH_ACCOUNTS_3),
+	// Credential shapes that must come from the POOL: the first account is
+	// installed at session start, replacing anything seeded into auth.json.
+	"accounts-expiring-first": ACCOUNTS(OAUTH_ACCOUNTS_EXPIRING_FIRST),
+	"accounts-dead-first": ACCOUNTS(OAUTH_ACCOUNTS_DEAD_FIRST),
+	// rotateOnQuota disabled: a quota error must NOT rotate.
+	"accounts-no-quota": ACCOUNTS(OAUTH_ACCOUNTS, { rotateOnQuota: false }),
+	// Points an account pool at the API-key-only fixture provider. keyrouter must
+	// refuse it: installing a blob on a provider with no OAuth auth resolves to
+	// nothing, so the pool would silently do harm.
+	"accounts-wrong-provider": {
+		providers: [{ name: "krtest", accounts: OAUTH_ACCOUNTS }],
+	}
 };
 
 // ---------------------------------------------------------------------------
@@ -199,14 +283,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 // pi
 // ---------------------------------------------------------------------------
+/**
+ * Run one pi print-mode request.
+ *
+ * `caseOpts` lets a case add extensions and override the provider, which is how
+ * the OAuth cases load test/fixture/oauth-provider.ts and select `kroauth`
+ * instead of the api-key `krtest` provider.
+ */
 async function runPi(extraEnv) {
+	const opts = arguments[1] ?? {};
 	const args = [
 		...PI_PREFIX,
 		"-e", EXTENSION_ENTRY,
+		...(opts.extensions ?? []).flatMap((path) => ["-e", path]),
 		"--no-session",
 		"--no-tools",
-		"--provider", "krtest",
-		"--model", "fake-gpt",
+		"--provider", opts.provider ?? "krtest",
+		"--model", opts.model ?? "fake-gpt",
 		"--thinking", "off",
 		"-p", "Reply with exactly: PONG",
 	];
@@ -219,6 +312,8 @@ async function runPi(extraEnv) {
 		PI_SKIP_VERSION_CHECK: "1",
 		PI_TELEMETRY: "0",
 		PI_CACHE_WARMING: "off",
+		KR_FAKE_BASE: BASE,
+		...(opts.env ?? {}),
 		...extraEnv,
 	};
 	return new Promise((done) => {
@@ -503,15 +598,16 @@ const cases = [
 		config: "abc-takeover",
 		auth: OAUTH_AUTH_JSON,
 		plan: { default: "ok", text: "PONG" },
-		expect: ({ keys, trace, pi }) => [
-			["no skip reported", !traceHas(trace, "skip krtest")],
-			["pool bootstrapped", traceHas(trace, "bootstrap krtest -> A")],
-			["pooled key reached the server", keys[0] === "sk-a"],
-			["pi printed PONG", /PONG/.test(pi.stdout)],
-			["override cleaned up", traceHas(trace, "clear krtest")],
-		],
-	},
-];
+			expect: ({ keys, trace, pi }) => [
+				["no skip reported", !traceHas(trace, "skip krtest")],
+				["pool bootstrapped", traceHas(trace, "bootstrap krtest -> A")],
+				["pooled key reached the server", keys[0] === "sk-a"],
+				["pi printed PONG", /PONG/.test(pi.stdout)],
+				["override cleaned up", traceHas(trace, "clear krtest")],
+			],
+		},
+		...oauthCases,
+	];
 
 function orderedBefore(trace, earlier, later) {
 	const a = trace.findIndex((line) => line.includes(earlier));
@@ -584,6 +680,12 @@ async function main() {
 	mkdirSync(ARTIFACTS, { recursive: true });
 	if (existsSync(TRACE)) rmSync(TRACE);
 	const modelsPath = await prepareFixture();
+	// Record the user's REAL credentials before anything runs. Every case must
+	// stay inside the fixture agent dir, so this digest must be unchanged at the
+	// end — a release blocker if it is not.
+	const realAuthBefore = fileDigest(REAL_AUTH_JSON);
+
+
 
 	if (!(await probePi())) {
 		console.error(`cannot run pi --version (PI_CMD=${PI_CMD}, PI_CLI_JS=${PI_CLI_JS ?? "(none)"}) — set PI_BIN or PI_CLI_JS`);
@@ -620,10 +722,25 @@ async function main() {
 		const authPath = join(AGENT_DIR, "auth.json");
 		if (c.auth) writeFileSync(authPath, JSON.stringify(c.auth, null, 2) + "\n", "utf8");
 		else if (existsSync(authPath)) rmSync(authPath);
-		const pi = await runPi(c.env ?? {});
+
+		// OAuth cases load the fixture provider that registers `kroauth`, and the
+		// fixture's refresh hook writes here. Removed per case so a leftover log
+		// cannot make a later case look refreshed.
+		if (existsSync(OAUTH_LOG)) rmSync(OAUTH_LOG);
+		const pi = await runPi(c.env ?? {}, c.oauth ? OAUTH_RUN_OPTS : undefined);
 		const log = await serverRequestLog();
 		const trace = readTrace();
-		const ctx = { log, trace, keys: keysOf(log), statuses: statusesOf(log), pi };
+		const ctx = {
+			log,
+			trace,
+			keys: keysOf(log),
+			statuses: statusesOf(log),
+			pi,
+			oauthLog: readOauthLog(),
+			// Read back AFTER the run so a case can assert on what keyrouter left
+			// behind — e.g. that a sibling provider entry survived its writes.
+			authAfter: readAuthJson(),
+		};
 
 		const problems = [];
 		let checks = [];
@@ -650,10 +767,21 @@ async function main() {
 	if (keepOpen) console.log(`\nserver left on ${BASE} (pid ${serverProc?.pid}) — server log: ${SERVER_LOG}`);
 	else serverProc?.kill();
 
+	// The real user credentials must be untouched. Every case runs against the
+	// fixture agent dir, so any difference here means a bug could have logged the
+	// user out or overwritten a live credential.
+	const realAuthAfter = fileDigest(REAL_AUTH_JSON);
+	const realAuthIntact = realAuthBefore === realAuthAfter;
+	console.log(`\nreal auth.json ${REAL_AUTH_JSON}`);
+	console.log(`  sha256 before ${realAuthBefore}`);
+	console.log(`  sha256 after  ${realAuthAfter}`);
+	console.log(`  ${realAuthIntact ? "unchanged" : "CHANGED — THE SUITE TOUCHED REAL CREDENTIALS"}`);
+
 	const failed = results.filter((r) => !r.ok);
 	console.log(`\n${results.length - failed.length}/${results.length} passed`);
 	if (failed.length) console.log(`failed: ${failed.map((f) => f.name).join(", ")}`);
-	process.exit(failed.length ? 1 : 0);
+	if (!realAuthIntact) console.log("RELEASE BLOCKER: real auth.json was modified by the suite");
+	process.exit(failed.length || !realAuthIntact ? 1 : 0);
 }
 
 function dump(ctx) {
