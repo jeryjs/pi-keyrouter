@@ -144,7 +144,6 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let credentialApiChecked = false;
 	let lastErrorNotified = false;
 
-
 	/**
 	 * Get-or-create the runtime for a provider, keyed by the real provider id.
 	 */
