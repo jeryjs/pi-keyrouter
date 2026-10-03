@@ -815,9 +815,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("keyrouter", {
-		description: "manage key rotation (status, reload, reset)",
+		description: "manage credential pools (status, reload, reset, account)",
 		handler: async (args, ctx) => {
-			const sub = args.trim().split(/\s+/)[0] ?? "status";
+			const parsed = parseCommandArgs(args);
+			const sub = parsed.sub;
 			if (sub === "status") {
 				// On-demand activation in case session_start/before_agent_start
 				// haven't fired yet (e.g. user ran /keyrouter status right after
@@ -928,12 +929,142 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
-			ctx.ui.notify("Usage: /keyrouter [status|reload|reset]", "info");
+			if (sub === "account") {
+				// Manual pin: use a specific pool credential until the next rotation
+				// moves off it. Applies to either pool kind.
+				if (!config || runtimes.size === 0) await activate(ctx);
+				const wanted = parsed.args[0];
+				const label = parsed.args[1];
+				if (!wanted) {
+					ctx.ui.notify(
+						`🔑 keyrouter: usage — /keyrouter ${parsed.usage}`,
+						"warning",
+					);
+					return;
+				}
+
+				const providerId = resolveProviderId(ctx.modelRegistry, wanted);
+				const rt = runtimes.get(providerId);
+				if (!rt) {
+					const known = [...runtimes.keys()];
+					ctx.ui.notify(
+						`🔑 keyrouter: "${wanted}" is not an active pool. ` +
+							(known.length > 0 ? `Active: ${known.join(", ")}.` : "No pools are active."),
+						"warning",
+					);
+					return;
+				}
+
+				// Report the pool instead of guessing when no entry is named.
+				if (!label) {
+					const names = rt.keys.map((k) => k.name);
+					const active = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex]?.name : undefined;
+					ctx.ui.notify(
+						`🔑 keyrouter: ${providerId} (${rt.kind}) — active: ${active ?? "(none)"}\n` +
+							`Choose one: /keyrouter account ${providerId} <${names.join("|")}>`,
+						"info",
+					);
+					return;
+				}
+
+				// Exact name first, then case-insensitive, then ordinal (1-based).
+				let idx = rt.keys.findIndex((k) => k.name === label);
+				if (idx < 0) {
+					const lower = label.toLowerCase();
+					idx = rt.keys.findIndex((k) => k.name.toLowerCase() === lower);
+				}
+				if (idx < 0 && /^\d+$/.test(label)) {
+					const ordinal = Number(label) - 1;
+					if (ordinal >= 0 && ordinal < rt.keys.length) idx = ordinal;
+				}
+				if (idx < 0) {
+					const names = rt.keys.map((k) => k.name);
+					ctx.ui.notify(
+						`🔑 keyrouter: no entry "${label}" in ${providerId}. Available: ${names.join(", ")}`,
+						"warning",
+					);
+					return;
+				}
+
+				const entry = rt.keys[idx];
+				if (!entry) return;
+				const previous = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex]?.name : undefined;
+				if (idx === rt.currentIndex) {
+					ctx.ui.notify(`🔑 keyrouter: ${providerId} is already using ${entry.name}.`, "info");
+					return;
+				}
+
+				// Install through the same helpers rotation uses, so a manual switch is
+				// subject to the same capture/clear rules as an automatic one.
+				if (rt.kind === "oauth") {
+					await captureAccount(providerId, rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined);
+					if (!(await applyAccount(providerId, entry, ctx))) {
+						ctx.ui.notify(`🔑 keyrouter: could not install ${entry.name} for ${providerId}.`, "error");
+						return;
+					}
+					await captureAccount(providerId, entry);
+				} else {
+					if (!(await applyKey(providerId, entry.value, ctx))) {
+						ctx.ui.notify(`🔑 keyrouter: could not install ${entry.name} for ${providerId}.`, "error");
+						return;
+					}
+				}
+
+				// A manual pick is deliberate, so clear any cooldown rather than leaving
+				// a chosen entry that the picker would immediately skip, and drop any
+				// pending continuation — the user is not waiting on a retry.
+				markOk(entry);
+				rt.currentIndex = idx;
+				rt.pendingContinue = false;
+				recordUse(entry);
+				const noun = rt.kind === "oauth" ? "account" : "key";
+				trace(`manual ${providerId} ${previous ?? "(none)"} -> ${entry.name} (/${noun})`);
+				ctx.ui.notify(
+					`🔑 keyrouter: ${providerId} now using ${noun} ${entry.name}` +
+						(idx === 0 ? " (pool default)" : "") +
+						`. Rotation continues from here.`,
+					"info",
+				);
+				return;
+			}
+			ctx.ui.notify(`Usage: /keyrouter [${SUBCOMMANDS.join("|")}]`, "info");
 		},
 	});
 }
 
 
+
+/** Subcommands accepted by `/keyrouter`, in usage order. */
+export const SUBCOMMANDS = ["status", "reload", "reset", "account"] as const;
+
+/**
+ * Parse `/keyrouter` arguments into a subcommand plus its operands.
+ *
+ * Extracted from the handler so the argument handling is a pure, testable unit:
+ * slice commands cannot be driven from print mode, so this is what the test suite
+ * can actually exercise (`test/unit-oauth.mjs`).
+ *
+ * `args` is the raw text after `/keyrouter`. Extra whitespace is collapsed, and
+ * a missing or unrecognised subcommand falls back to `status` — the friendly
+ * default for a bare `/keyrouter`.
+ */
+export function parseCommandArgs(args: string): {
+	sub: string;
+	/** Operands after the subcommand: [provider, entryName?] for `account`. */
+	args: string[];
+	/** The exact `/keyrouter …` form to show the user for this subcommand. */
+	usage: string;
+} {
+	const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+	const first = tokens[0]?.toLowerCase() ?? "";
+	const sub = (SUBCOMMANDS as readonly string[]).includes(first) ? first : "status";
+	// A bare `/keyrouter` or an unknown word behaves as `status` with no operands:
+	// the unknown word was a subcommand guess, not an argument.
+	const rest = (SUBCOMMANDS as readonly string[]).includes(first) ? tokens.slice(1) : [];
+	const usage =
+		sub === "account" ? "account <provider> [name|index]" : sub;
+	return { sub, args: rest, usage };
+}
 /** Provider id recorded on an assistant message (the physical provider). */
 function messageProviderId(msg: { provider?: string }): string | undefined {
 	return typeof msg.provider === "string" && msg.provider.length > 0 ? msg.provider : undefined;

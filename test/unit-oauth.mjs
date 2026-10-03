@@ -23,6 +23,10 @@ const { parseAccountCredential, validateCredential, loadConfig, expandEnv, confi
 	"../config.ts"
 );
 const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = await import("../rotation.ts");
+// Importing index.ts binds no pi APIs at module scope (the extension only
+// registers handlers inside its default export), so the pure command parser is
+// reachable from a plain Node process.
+const { parseCommandArgs, SUBCOMMANDS } = await import("../index.ts");
 
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -290,6 +294,49 @@ check(
 );
 check("expandEnv still works", expandEnv("sk-$KR_UNIT_CRED") !== undefined);
 check("configPath honours the override", configPath() === process.env.PI_KEYROUTER_CONFIG || true);
+
+// ---------------------------------------------------------------------------
+// 9. /keyrouter argument parsing
+//
+// Slash commands only exist in the interactive TUI, so print-mode tests cannot
+// reach the handler. The parser is therefore a pure exported function, and this
+// is where its behaviour is pinned. The handler's install/cooldown/continuation
+// calls in the `account` branch are the same helpers the e2e suite exercises
+// through automatic rotation.
+// ---------------------------------------------------------------------------
+check("SUBCOMMANDS lists all four", SUBCOMMANDS.join(",") === "status,reload,reset,account");
+
+const bare = parseCommandArgs("");
+check("a bare /keyrouter defaults to status", bare.sub === "status" && bare.args.length === 0);
+check("a bare /keyrouter reports no operands, not an error", bare.args.join() === "");
+check("whitespace-only args default to status", parseCommandArgs("   ").sub === "status");
+check("a missing arg string does not throw", parseCommandArgs(undefined).sub === "status");
+
+check("explicit status", parseCommandArgs("status").sub === "status");
+check("reload", parseCommandArgs("reload").sub === "reload");
+check("reset", parseCommandArgs("reset").sub === "reset");
+check("subcommand is case-insensitive", parseCommandArgs("STATUS").sub === "status");
+check("surrounding whitespace is tolerated", parseCommandArgs("  reload  ").sub === "reload");
+check("an unknown word falls back to status", parseCommandArgs("bogus").sub === "status");
+check("an unknown word is NOT treated as an operand", parseCommandArgs("bogus").args.length === 0);
+
+const acct = parseCommandArgs("account cline");
+check("account parses its provider", acct.sub === "account" && acct.args[0] === "cline");
+check("account with no name has just one operand", acct.args.length === 1);
+check("account usage is self-describing", /account <provider>/.test(acct.usage));
+
+const named = parseCommandArgs("account cline work");
+check("account parses provider + name", named.args[0] === "cline" && named.args[1] === "work");
+const ordinal = parseCommandArgs("account cline 2");
+check("account accepts an ordinal", ordinal.args[1] === "2");
+check("account tolerates extra whitespace", parseCommandArgs("account   cline    work").args[1] === "work");
+check("account is case-insensitive", parseCommandArgs("ACCOUNT cline").sub === "account");
+check(
+	"operand case is preserved (provider ids and names are case-sensitive)",
+	parseCommandArgs("account CLINE Work").args.join(",") === "CLINE,Work",
+);
+check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
+check("status takes no operands, usage is just the subcommand", parseCommandArgs("status").usage === "status");
 
 console.log(failures === 0 ? "\nall oauth unit tests pass" : `\n${failures} unit test(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

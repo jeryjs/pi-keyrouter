@@ -909,6 +909,34 @@ correctly **not** rotated, and every override was cleared on shutdown.
 
 ### Still open
 
-§10 stands: `rotateOnQuota` defaults to `true` for `accounts` pools (confirm), and a manual
-`/keyrouter account <provider> <name>` selector plus mixed `keys`+`accounts` pools remain
-unimplemented because nothing in the success criteria needs them.
+§10 question 1 stands: `rotateOnQuota` defaults to `true` for `accounts` pools (confirm). Question 2
+is now implemented — see §12. Mixed `keys`+`accounts` pools (question 3) remain unimplemented
+because nothing in the success criteria needs them.
+
+---
+
+## 12. Follow-up: manual selector (v1.1.0)
+
+`/keyrouter account <provider> [name|index]` was added after the initial OAuth work, answering §10
+question 2. It pins a pool to a specific key or account, and works for **either** pool kind.
+
+Design points worth keeping:
+
+- The install path is **shared with automatic rotation** (`applyAccount` / `applyKey`, with
+  `captureAccount` before leaving the previous credential). A second install path would have been the
+  easiest way to lose pi's rotated refresh token.
+- A pinned entry gets `markOk`, clearing its cooldown: a manual pick is deliberate and must not be one
+  the automatic picker would immediately skip. `pendingContinue` is also cleared, because the user is
+  not waiting on a retry. Rotation then continues from the pinned index, so this is a nudge rather
+  than a lock.
+- Resolution order is exact name → case-insensitive name → 1-based ordinal, and every failure mode
+  (unknown provider, unknown name, no name supplied) reports the available choices rather than failing
+  silently.
+- Slash commands are **interactive-only**, so `parseCommandArgs` was extracted as a pure exported
+  function and unit-tested (16 checks). The handler was then verified **live in the TUI**: status
+  rendering, the no-arg listing, switch by name, switch by ordinal, unknown provider, unknown name,
+  and a real `auth.json` showing `access-2` with the unrelated provider entry intact — followed by
+  `oauth restore kroauth -> session-start credential` on exit.
+
+Version bumped `1.0.0` → `1.1.0`: a new feature, backwards compatible in both directions
+(`keys`-only configs are unaffected and no existing behaviour changed).

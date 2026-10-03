@@ -226,7 +226,25 @@ error, rather than leaving you logged out.
 /keyrouter status    live pool state per provider (kind, active entry, install state, expiry)
 /keyrouter reload     re-read ~/.pi/keyrouter.json
 /keyrouter reset      hand providers back to pi's own credentials immediately
+/keyrouter account <provider> [name|index]    pin a specific key or account
 ```
+
+`account` switches a pool to a specific credential, and works for either pool kind. It accepts an
+exact name, a case-insensitive name, or a 1-based index. With no name it reports the pool and the
+available choices:
+
+```
+/keyrouter account cline         → cline (oauth) — active: work
+                                   Choose one: /keyrouter account cline <work|home>
+/keyrouter account cline home    → cline now using account home. Rotation continues from here.
+/keyrouter account cline 1       → cline now using account work (pool default).
+```
+
+A pinned credential has its **cooldown cleared** — a manual pick is deliberate, so it must not be
+one the automatic picker would immediately skip — and any pending retry is dropped. Rotation then
+continues from the pinned position on the next failure, so this is a nudge rather than a lock.
+Installs go through exactly the same path as automatic rotation, including capturing pi's rotated
+blob before leaving the previous credential.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and
@@ -285,10 +303,16 @@ is the executable record of the behaviour both depend on; run it first when bump
 bun install
 bun x tsc --noEmit -p tsconfig.json          # strict + noUncheckedIndexedAccess
 node test/fake-openai-server.mjs --selftest  # the fake server's own plan engine
-node test/unit-oauth.mjs                     # config parsing + store guards (no pi needed)
+node test/unit-oauth.mjs                     # config parsing, store guards, /keyrouter args (no pi needed)
 node test/verify-runtime-credentials.mjs     # probes pi's credential-store behaviour
 node test/oauth-fixture-smoke.mjs            # proves the OAuth fixture works WITHOUT keyrouter
 node test/run.mjs                            # end-to-end, 27 cases
+```
+
+Slash commands only exist in the interactive TUI, so `/keyrouter account` cannot be reached from a
+`--print` run. Its argument handling is therefore a pure exported function (`parseCommandArgs`)
+covered by `unit-oauth.mjs`, and the effect of a switch — including pi's refreshed-blob capture and
+the shutdown restore — is exercised live in the TUI and by the automatic-rotation cases.
 ```
 
 `test/run.mjs` starts `test/fake-openai-server.mjs` on an OS-assigned free port, spawns real
