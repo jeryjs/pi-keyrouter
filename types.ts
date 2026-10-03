@@ -10,13 +10,18 @@ export interface ApiKey {
 
 /** Configuration for a single provider. */
 export interface ProviderConfig {
-  /** Display name (e.g. "z-ai", "openrouter"). For logging. */
+  /** Provider id pi uses: built-in (`google`), a `models.json` id, or another
+   *  extension's id. Matched case-insensitively against pi's known providers. */
   name: string;
-  /** URL substrings to match. If request URL contains any of these, the
-   *  wrapper handles it. Match is case-insensitive. */
-  match: string[];
+  /** Legacy field, accepted and ignored. Rotation is keyed by provider id, not URL. */
+  match?: string[];
   /** Ordered list of keys. First key used by default; on 429/401, rotate. */
   keys: ApiKey[];
+  /**
+   * Inject pooled keys even when the user has a stored OAuth login for this
+   * provider. Off by default: a runtime api_key shadows the OAuth credential.
+   */
+  takeoverOAuth?: boolean;
 }
 
 /** Top-level config. */

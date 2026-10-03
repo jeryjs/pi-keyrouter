@@ -1,16 +1,21 @@
 {
   "name": "pi-keyrouter",
-  "version": "0.4.0",
-  "description": "API key rotation for pi-coding-agent. Multiple keys per provider, automatic 429/401 fallback, max-retries guard.",
+  "version": "1.0.0",
+  "description": "API key pools for pi. Rotates keys inside providers you already have (built-in, models.json, or another extension's) on 429/401/403. Never registers its own provider; pi keeps auth, OAuth and retries.",
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "test": "bun test",
-    "typecheck": "bun x tsc --noEmit"
+    "test": "node test/fake-openai-server.mjs --selftest && node test/run.mjs",
+    "test:e2e": "node test/run.mjs",
+    "typecheck": "bun x tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {},
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.0",
@@ -24,7 +29,8 @@
     "config.ts",
     "rotation.ts",
     "notification.ts",
-    "types.ts"
+    "types.ts",
+    "test/"
   ],
   "keywords": [
     "pi",
