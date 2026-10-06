@@ -9,9 +9,12 @@ Built for **pi 1.0.0**. Auth, retries, OAuth, refresh, storage and headers stay 
 this extension only chooses which credential pi resolves.
 
 > Originally created by [lowern1ght](https://github.com/lowern1ght). Forked, maintained, and substantially improved by [jeryjs](https://github.com/jeryjs).
+>
+> Release notes for every version, including the original `0.1.0` – `0.4.0` line, are in
+> [CHANGELOG.md](./CHANGELOG.md).
 
 ```bash
-pi install D:/path-to-project/pi-keyrouter   # or npm:pi-keyrouter once published
+pi install git:github.com/jeryjs/pi-keyrouter   # or npm:jeryjs/pi-keyrouter once published
 # create ~/.pi/keyrouter.json with your keys or accounts
 /reload
 ```
