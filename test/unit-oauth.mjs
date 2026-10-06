@@ -13,7 +13,7 @@
 // TypeScript sources are loaded through Node's type-stripping, so no build step
 // is involved — same as pi's own jiti loading of the extension.
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -337,6 +337,106 @@ check(
 );
 check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
 check("status takes no operands, usage is just the subcommand", parseCommandArgs("status").usage === "status");
+
+// ---------------------------------------------------------------------------
+// 10. writeBackCredentials — persisting a refreshed credential
+//
+// Without this, keyrouter installs the account whose access token was current
+// at its last login (~1h of life) and pi writes the refreshed pair only to its
+// own store — so every return to the account presents an already-expired access
+// token and the account reads as dead. `sameCredential` gates the write so a
+// no-op capture never touches the user's file.
+// ---------------------------------------------------------------------------
+const { writeBackCredentials } = await import("../config.ts");
+const { sameCredential } = await import("../index.ts");
+
+// sameCredential: both secrets, not just one — providers differ in what rotates.
+check(
+	"sameCredential accepts identical blobs",
+	sameCredential({ type: "oauth", access: "a", refresh: "r", expires: 1 }, { type: "oauth", access: "a", refresh: "r", expires: 1 }),
+);
+check(
+	"sameCredential rejects a rotated access token",
+	!sameCredential(
+		{ type: "oauth", access: "a", refresh: "r", expires: 1 },
+		{ type: "oauth", access: "a2", refresh: "r", expires: 1 },
+	),
+);
+check(
+	"sameCredential rejects a rotated refresh token",
+	!sameCredential(
+		{ type: "oauth", access: "a", refresh: "r", expires: 1 },
+		{ type: "oauth", access: "a", refresh: "r2", expires: 1 },
+	),
+);
+check(
+	"sameCredential rejects a moved expiry",
+	!sameCredential(
+		{ type: "oauth", access: "a", refresh: "r", expires: 1 },
+		{ type: "oauth", access: "a", refresh: "r", expires: 2 },
+	),
+);
+check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sameCredential(VALID, undefined));
+
+{
+	// The earlier sections already removed their temp dir, so this block owns a
+	// separate one: a write test must never share (or rely on) another fixture.
+	const persistDir = mkdtempSync(join(tmpdir(), "kr-unit-persist-"));
+	try {
+
+	// An inline-object account gets the refreshed values merged in; the sibling
+	// account, the unknown top-level fields and the provider-specific extras stay
+	// byte-identical.
+	const persistFile = join(persistDir, "keyrouter-persist.json");
+	const seed = {
+		providers: [
+			{
+				name: "cline",
+				accounts: [
+					{
+						name: "a1",
+						credential: { type: "oauth", access: "old-access", refresh: "refresh-1", expires: 1000, accountId: "keep-me" },
+					},
+					{ name: "a2", credential: { type: "oauth", access: "untouched", refresh: "refresh-2", expires: 2000 } },
+				],
+			},
+		],
+		maxRetries: 3,
+		_customTopLevelField: "must-survive",
+	};
+	writeFileSync(persistFile, JSON.stringify(seed, null, 2) + "\n", "utf8");
+
+	process.env.PI_KEYROUTER_CONFIG = persistFile;
+	const updated = writeBackCredentials(
+		new Map([["cline\u0000a1", { type: "oauth", access: "new-access", refresh: "refresh-1", expires: 9999 }]]),
+	);
+	check("writeBackCredentials reports one update", updated.updated === 1);
+
+	const after = JSON.parse(readFileSync(persistFile, "utf8"));
+	const a1 = after.providers[0].accounts[0].credential;
+	check("write-back carries the refreshed access forward", a1.access === "new-access");
+	check("write-back carries the moved expiry forward", a1.expires === 9999);
+	check("write-back preserves provider-specific extras", a1.accountId === "keep-me");
+	check("write-back preserves the unchanged account", after.providers[0].accounts[1].credential.access === "untouched");
+	check("write-back preserves unknown top-level fields", after._customTopLevelField === "must-survive");
+	check("write-back preserves maxRetries", after.maxRetries === 3);
+
+	// A second call with the same values is a no-op: the file must be untouched.
+	const again = writeBackCredentials(
+		new Map([["cline\u0000a1", { type: "oauth", access: "new-access", refresh: "refresh-1", expires: 9999 }]]),
+	);
+	check("an identical credential is a no-op", again.updated === 0);
+	check("no-op write does not rewrite the file", readFileSync(persistFile, "utf8") === JSON.stringify(after, null, 2) + "\n");
+
+	// An unknown provider/account key is silently skipped.
+	const ghost = writeBackCredentials(new Map([["ghost\u0000a9", VALID]]));
+	check("an unknown pool is a no-op", ghost.updated === 0);
+
+	delete process.env.PI_KEYROUTER_CONFIG;
+	} finally {
+		rmSync(persistDir, { recursive: true, force: true });
+	}
+}
 
 console.log(failures === 0 ? "\nall oauth unit tests pass" : `\n${failures} unit test(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

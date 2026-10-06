@@ -940,3 +940,104 @@ Design points worth keeping:
 
 Version bumped `1.0.0` → `1.1.0`: a new feature, backwards compatible in both directions
 (`keys`-only configs are unaffected and no existing behaviour changed).
+
+---
+
+## 13. Bug fix: refreshed credentials were never persisted (v1.1.1)
+
+### What was reported
+
+A `cline` accounts pool failed with, in sequence:
+
+```
+Error: OAuth refresh failed for cline: Cline token refresh failed. Run /login cline to re-authenticate.
+Warning: 🔑 keyrouter: cline jery99961 → jsjery123 (HTTP 401, refresh-failed)
+Error: OAuth refresh failed for cline: ...
+Warning: 🔑 keyrouter: cline jsjery123 → jery2005may (HTTP 401, refresh-failed)
+```
+
+Every account appeared dead, one after another.
+
+### How it was investigated
+
+1. **Read the OAuth semantics** (RFC 9700 §4.14.2, WorkOS/AuthKit session-resilience docs) to
+   establish what is *supposed* to happen. Two facts mattered: WorkOS rotates refresh tokens on
+   exchange with a 30s replay grace period, and RFC 9700 says a replayed token revokes the whole
+   token family. That made "keyrouter itself is replaying tokens" the leading hypothesis.
+2. **Decoded the JWT claims** of every stored access token (read-only; signature not verified,
+   ids hashed, no token printed). This disproved two guesses at once: all four accounts were
+   distinct WorkOS users (different `sub`), so it was not one session installed four times; and
+   every `refresh` value was a genuine opaque 25-char WorkOS secret, not an errant ID token —
+   so the callback's `idToken` fallback was not the cause.
+3. **Probed the live endpoint** (`test/cline-refresh-probe.mjs`, one request per account, nothing
+   persisted). This settled it:
+
+   | account | result |
+   |---|---|
+   | `jery99961` | HTTP 400 `invalid_grant` — genuinely dead |
+   | `jsjery123` | HTTP 400 `invalid_grant` — genuinely dead |
+   | `jery2005may` | healthy (pi had refreshed it successfully) |
+   | `jeryharryvm` | **HTTP 200 success** — healthy |
+   |
+   | and critically: `refresh token UNCHANGED` — **Cline does not rotate refresh tokens at all.** |
+
+### Root cause
+
+**keyrouter never wrote to `keyrouter.json`.** `grep` for `writeFileSync` in the sources returned
+nothing — the credential pool was read-only.
+
+pi refreshes lazily and persists the rotated pair to `auth.json`. keyrouter holds its own copy of
+each account, and installing account #2 **overwrites** what pi refreshed. So the pool's copy kept
+whatever was there at that account's last login. WorkOS **access tokens live 60 minutes**, so after
+any real use the pool was installing an already-expired access token:
+
+```
+login 19:11 → access exp 20:11        (viable for 1h)
+pool copy stays at exp 20:11 forever  (dead from 20:11 onward)
+```
+
+…and the request fails with a refresh error, which keyrouter then rotates on. Two of the four
+accounts were additionally expired outright (late Sept logins), which made the failure look
+worse than it was. The other two were salvageable — the probe proved it — but keyrouter's stale
+copies made them look dead.
+
+Contributing factor: the reference implementation keyrouter borrowed its refresh handling from
+(`pi-free`'s line) assumes the rotation race is the hazard. That is a real hazard in general, but
+Cline does not rotate, and the actual hazard here was simpler: **the pool's copy going stale.**
+
+### Fix
+
+- `config.ts` → `writeBackCredentials()`: merges a refreshed credential into `keyrouter.json` in
+  place. Only inline-object accounts are eligible (`$ENV`/`@file` are the user's own indirection),
+  only the credential fields change, the write is atomic (temp + rename), it is skipped when
+  nothing changed, and a failure warns once instead of throwing.
+- `index.ts` → `captureAccount(rt, entry, persist = true)` calls it after updating its in-memory
+  copy; `sameCredential()` decides whether a write is needed. The runtime gained `configName`,
+  because the config must be matched by the name the user wrote — `resolveProviderId` may have
+  canonicalized it (`z-ai` → `zai`).
+- `UNAUTHORIZED_RE` was matching `401` inside pi's `OAuth refresh failed for …` wrapper and
+  mislabelling a dead credential as a plain unauthorized error. The refresh-failure test now runs
+  **first**, because it is strictly more specific.
+
+### Verification
+
+- `oauth-persists-refreshed-credential-to-config` asserts the refreshed value reaches the **config
+  file**, not just memory. Proven to be a real test: temporarily disabling the write makes it fail
+  on exactly the write-back assertions and nothing else.
+- `oauth-does-not-churn-config-when-nothing-changed` guards the no-op path.
+- 20 new unit checks cover `writeBackCredentials` (provider-specific extras, sibling accounts,
+  unknown top-level fields, no-op behaviour, unknown pool) and `sameCredential` (both secrets).
+- 29/29 e2e, 89/89 unit, `tsc` clean, real `auth.json` unchanged.
+- Run against the real config: `keyrouter.json` was **byte-identical** afterwards (nothing needed
+  persisting, correctly no-op) and the pool still installed/restored cleanly.
+
+### Lesson
+
+When a component *copies* a resource that another component *owns and mutates*, the copy needs a
+write-back path or it silently becomes stale. The failure mode is nasty because it looks like an
+upstream auth problem — the error came from Cline's refresh endpoint, and the tokens really were
+rejected; they were rejected because keyrouter presented hours-old values, not because the accounts
+were bad. The investigation order that worked was: read the spec to form a hypothesis, use local
+forensics (JWT claims) to falsify the cheap guesses, then probe the real endpoint to settle it.
+
+(`keys`-only configs are unaffected and no existing behaviour changed).

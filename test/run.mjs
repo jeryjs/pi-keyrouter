@@ -79,6 +79,24 @@ function readAuthJson() {
 }
 
 /**
+ * Parse the fixture keyrouter config after a run.
+ *
+ * This is the OBSERVABLE PROOF that a captured credential was persisted: pi
+ * writes a refreshed pair to its own store, and only a write-back puts it in
+ * keyrouter's config. Without it the pool would keep installing the access token
+ * from an account's last login and every account would look dead.
+ */
+function readKeyrouterConfig() {
+	if (!existsSync(KEYROUTER_CONFIG)) return undefined;
+	try {
+		return JSON.parse(readFileSync(KEYROUTER_CONFIG, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+
+/**
  * sha256 of a file, or "(absent)". Used to prove the suite never touches the
  * user's real credentials — every case runs in the fixture agent dir.
  */
@@ -738,8 +756,10 @@ async function main() {
 			pi,
 			oauthLog: readOauthLog(),
 			// Read back AFTER the run so a case can assert on what keyrouter left
-			// behind — e.g. that a sibling provider entry survived its writes.
+			// behind — e.g. that a sibling provider entry survived its writes, or that a
+			// refreshed credential was persisted back into the pool config.
 			authAfter: readAuthJson(),
+			configAfter: readKeyrouterConfig(),
 		};
 
 		const problems = [];

@@ -198,11 +198,22 @@ uses the api-key overlay for an `accounts` pool: `setRuntimeApiKey` stores only 
 resolver returns early on any override — on an OAuth-only provider that yields **no auth at all**,
 and on a dual-auth provider it **freezes the token** so pi stops refreshing it.
 
-**Refresh stays pi's job, always.** keyrouter never refreshes a token. Because pi rotates refresh
-tokens in place, keyrouter reads the live credential back into the pool both when it leaves an
-account and after installing one; otherwise a later return to that account would install a
-consumed refresh token and fail. A dead refresh token is treated as a dead account, and the pool
-rotates away from it.
+**Refresh stays pi's job, always.** keyrouter never refreshes a token. pi refreshes lazily and
+persists the result to `auth.json` — so keyrouter reads the live credential back into the pool both
+when it leaves an account and after installing one, and **writes the refreshed values back to
+`keyrouter.json`**. That last part is essential rather than tidy: pi holds one credential per
+provider, so installing account #2 overwrites whatever pi refreshed, and keyrouter's own copy would
+otherwise still carry the access token from an account's **last login**. Since access tokens are
+short-lived (60 minutes for Cline), a stale copy means every account in the pool presents an
+expired token and the whole pool reads as dead. A dead refresh token is treated as a dead account,
+and the pool rotates away from it.
+
+The write-back is scoped and conservative: only accounts written as an **inline object** are
+updated (`$ENV` and `@file` references are left alone), only the credential fields change, and the
+write is skipped entirely when nothing moved, so a normal run never rewrites your config. It is
+atomic (temp file + rename), so an interrupted write cannot truncate a file holding live
+credentials. If the write fails you get one warning and the session continues — persistence is an
+optimization, not a requirement.
 
 **Persistence.** The pool owns the provider credential while the extension is loaded. On a clean
 shutdown (or `/keyrouter reset`) the credential that was stored when the session started is put

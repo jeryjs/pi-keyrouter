@@ -35,7 +35,7 @@
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync } from "node:fs";
-import { loadConfig, configPath } from "./config.ts";
+import { loadConfig, configPath, writeBackCredentials } from "./config.ts";
 import {
 	notifyRotation,
 	notifyOverloaded,
@@ -147,6 +147,13 @@ function runtimeCredentials(
 interface ProviderRuntime {
 	/** Provider id as pi knows it (the credential-overlay key). */
 	providerId: string;
+	/**
+	 * The provider name exactly as written in keyrouter.json. Needed to find the
+	 * config entry again when writing a refreshed credential back: the resolved id
+	 * may be a canonicalized form (`z-ai` -> `zai`) and the config file is never
+	 * rewritten to match it.
+	 */
+	configName: string;
 	/** Which mechanism this pool uses. `keys` = string overlay, `oauth` = store. */
 	kind: PoolKind;
 	/**
@@ -215,6 +222,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let lastErrorNotified = false;
 	/** Config warnings are reported once per config load. */
 	let warningsReported = false;
+	/** Reported once if refreshed credentials cannot be written back to disk. */
+	let persistNotifyErrorNotified = false;
 
 	/**
 	 * Get-or-create the runtime for a provider, keyed by the real provider id.
@@ -226,6 +235,11 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		if (rt) return rt;
 		rt = {
 			providerId,
+			// The name as the user wrote it. Persisting a refreshed credential has to
+			// find the config entry by this, because `resolveProviderId` may have
+			// canonicalized it (`z-ai` -> `zai`) and the config is never rewritten to
+			// the canonical form.
+			configName: providerCfg.name,
 			kind: providerCfg.kind,
 			// Only meaningful for OAuth pools; false for keys pools by construction.
 			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
@@ -441,11 +455,53 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 * consumed refresh token on a later return to that account — burning an
 	 * account that was perfectly healthy. This is why capture happens both before
 	 * swapping away and after installing.
+	 *
+	 * IMPORTANT: capturing into memory is not enough on its own. pi refreshes a
+	 * credential in place, but when keyrouter later installs a DIFFERENT account it
+	 * overwrites what pi stored — so the refreshed pair only survives if it is
+	 * written back to the config. Without that, a return to this account would
+	 * present the access token from its last login (~1h of life) and look dead.
 	 */
-	async function captureAccount(providerId: string, entry: KeyState | undefined): Promise<void> {
+	async function captureAccount(
+		rt: ProviderRuntime,
+		entry: KeyState | undefined,
+		persist = true,
+	): Promise<void> {
 		if (!storeApi || !entry) return;
-		const live = await captureCredential(storeApi, providerId);
-		if (live) entry.credential = live;
+		const live = await captureCredential(storeApi, rt.providerId);
+		if (!live) return;
+		// Skip the write when nothing moved: most captures happen inside a single
+		// token lifetime, and a no-op must never touch the user's config file.
+		const changed = !entry.credential || !sameCredential(entry.credential, live);
+		entry.credential = live;
+		if (persist && changed) persistCredential(rt, entry.name, live);
+	}
+
+	/**
+	 * Write a refreshed credential back into keyrouter.json.
+	 *
+	 * Best effort by design: persistence is an optimization, so a failure warns
+	 * once and the session continues. The pool still holds the fresh value in
+	 * memory for as long as keyrouter runs.
+	 */
+	function persistCredential(rt: ProviderRuntime, name: string, credential: KeyState["credential"]): void {
+		if (!credential) return;
+		const result = writeBackCredentials(
+			new Map([[`${rt.configName}\u0000${name}`, credential]]),
+		);
+		if ("error" in result) {
+			trace(`persist failed ${rt.providerId} ${name} (${result.error})`);
+			if (!persistNotifyErrorNotified) {
+				persistNotifyErrorNotified = true;
+				uiCtx?.notify(
+					`🔑 keyrouter: could not write refreshed credentials to ${configPath()} — ${result.error}. ` +
+						`Refreshes still work this session; the fix is to restore the file's permissions.`,
+					"warning",
+				);
+			}
+			return;
+		}
+		if (result.updated > 0) trace(`persist ${rt.providerId} ${name} (refreshed credential written back)`);
 	}
 
 	/**
@@ -463,7 +519,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		if (!storeApi) return;
 		const active = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
 		// Preserve pi's refreshed tokens for the account we are leaving.
-		await captureAccount(providerId, active);
+		await captureAccount(rt, active);
 
 		const original = rt.sessionStartCredential;
 		if (!original) {
@@ -549,7 +605,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				if (await applyAccount(providerId, key, ctx)) {
 					// Capture again: pi may have merged or normalized the blob, and this is
 					// the copy a later return to this account will install.
-					await captureAccount(providerId, key);
+					await captureAccount(rt, key);
 					accounted++;
 					trace(`oauth install ${providerId} -> ${key.name} (${rt.keys.length} account(s))`);
 				}
@@ -642,29 +698,25 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Rotation branch. Classification is kind-aware, because the two pool kinds
-		// treat an account-level limit in OPPOSITE ways:
+		// The refresh-failure test comes FIRST, and deliberately.
 		//
-		//   429 / rate limit       both: entry-specific, rotate.
-		//   401 / 403 / bad key   both: entry-specific, rotate.
-		//   quota / billing        keys: NEVER rotate (every key is the same
-		//                                 account, so switching cannot lift an
-		//                                 account-wide limit).
-		//                          oauth: rotate when rotateOnQuota (default true)
-		//                                 — each account is its own subscription.
-		//   refresh failed         oauth only: the credential itself is dead.
-		//   overload / 5xx         neither: handled above / ignored below.
+		// pi wraps a refresh failure as `OAuth refresh failed for <id>: ...`, and
+		// when the upstream HTTP status was 401 that wrapper text contains "401" —
+		// which UNAUTHORIZED_RE matches. Ordering it after that check mislabels a
+		// dead-refresh-token error as a plain unauthorized one, hitting the same
+		// pool entry but reporting the wrong cause. A refresh failure is strictly
+		// more specific, so it wins.
 		let reason: RotationReason | null = null;
 		let status = 0;
-		if (RATE_LIMITED_RE.test(errMsg)) {
+		if (rt.kind === "oauth" && REFRESH_FAILED_RE.test(errMsg)) {
+			reason = "refresh-failed";
+			status = errMsg.includes("401") ? 401 : 403;
+		} else if (RATE_LIMITED_RE.test(errMsg)) {
 			reason = "rate-limited";
 			status = 429;
 		} else if (UNAUTHORIZED_RE.test(errMsg)) {
 			reason = "unauthorized";
 			status = errMsg.includes("401") ? 401 : 403;
-		} else if (rt.kind === "oauth" && REFRESH_FAILED_RE.test(errMsg)) {
-			reason = "refresh-failed";
-			status = 401;
 		} else if (rt.kind === "oauth" && rt.rotateOnQuota && QUOTA_RE.test(errMsg)) {
 			reason = "quota";
 			status = 402;
@@ -715,14 +767,14 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 
 		if (rt.kind === "oauth") {
 			// 1. Preserve whatever pi refreshed for the account we are leaving.
-			await captureAccount(providerId, currentKey);
+			await captureAccount(rt, currentKey);
 			// 2. Install the next account.
 			if (!(await applyAccount(providerId, nextKey, ctx))) return;
 			rt.currentIndex = nextIdx;
 			recordUse(nextKey);
 			// 3. Read it back: pi may normalize or merge the blob, and this copy is
 			//    what a later return to this account will install.
-			await captureAccount(providerId, nextKey);
+			await captureAccount(rt, nextKey);
 			rt.pendingContinue = wantsContinue;
 			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
 		} else {
@@ -807,6 +859,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		uiCtx = undefined;
 		activationNotified = false;
 		warningsReported = false;
+		persistNotifyErrorNotified = false;
 		credentialApi = undefined;
 		credentialApiChecked = false;
 		storeApi = undefined;
@@ -895,6 +948,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				permanentSkip.clear();
 				activationNotified = false;
 				warningsReported = false;
+				persistNotifyErrorNotified = false;
 				credentialApiChecked = false;
 				credentialApi = undefined;
 				storeApiChecked = false;
@@ -997,12 +1051,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				// Install through the same helpers rotation uses, so a manual switch is
 				// subject to the same capture/clear rules as an automatic one.
 				if (rt.kind === "oauth") {
-					await captureAccount(providerId, rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined);
+					await captureAccount(rt, rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined);
 					if (!(await applyAccount(providerId, entry, ctx))) {
 						ctx.ui.notify(`🔑 keyrouter: could not install ${entry.name} for ${providerId}.`, "error");
 						return;
 					}
-					await captureAccount(providerId, entry);
+					await captureAccount(rt, entry);
 				} else {
 					if (!(await applyKey(providerId, entry.value, ctx))) {
 						ctx.ui.notify(`🔑 keyrouter: could not install ${entry.name} for ${providerId}.`, "error");
@@ -1064,6 +1118,23 @@ export function parseCommandArgs(args: string): {
 	const usage =
 		sub === "account" ? "account <provider> [name|index]" : sub;
 	return { sub, args: rest, usage };
+}
+
+/**
+ * True when two credentials carry the same secrets and expiry.
+ *
+ * Used to avoid rewriting the user's config file on every capture: pi refreshes
+ * lazily, so most captures return exactly what the pool already holds, and a
+ * needless write would churn the file (and its mtime) for nothing.
+ *
+ * Both secrets are compared because providers differ in which one rotates —
+ * Cline rotates neither, some providers rotate only the access token, and others
+ * rotate the refresh token too. Comparing only one would silently drop the other
+ * half of a rotated pair. Values are compared, never logged.
+ */
+export function sameCredential(a: KeyState["credential"], b: KeyState["credential"]): boolean {
+	if (!a || !b) return a === b;
+	return a.access === b.access && a.refresh === b.refresh && a.expires === b.expires;
 }
 /** Provider id recorded on an assistant message (the physical provider). */
 function messageProviderId(msg: { provider?: string }): string | undefined {

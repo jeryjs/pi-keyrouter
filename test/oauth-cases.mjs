@@ -236,7 +236,7 @@ export const oauthCases = [
 		expect: ({ keys, trace, pi, oauthLog }) => [
 			["pi eventually recovered", /PONG/.test(pi.stdout)],
 			["pi attempted the refresh of the dead account", (oauthLog ?? []).some((l) => l.includes("refresh access=access-dead"))],
-			["trace: classified as a dead credential", traceHas(trace, "401 refresh-failed")],
+			["trace: classified as a dead credential (the refresh reason wins over the 401/403 net)", traceHas(trace, "refresh-failed")],
 			["trace: rotated away from it", traceHas(trace, "rotate kroauth a1 -> a2")],
 			["a later request used the healthy account", keys.includes(ACCESS_2)],
 		],
@@ -337,12 +337,55 @@ export const oauthCases = [
 		oauth: true,
 		auth: authJson(),
 		plan: { sequence: [529], repeatLast: true },
-		expect: ({ keys, trace, pi }) => [
-			["pi reported the overload", pi.code !== 0 || /overload/i.test(`${pi.stdout}\n${pi.stderr}`)],
-			["zero rotations", traceCount(trace, "rotate") === 0],
-			["trace: overload branch", traceHas(trace, "overload kroauth")],
-			["no exhaustion", !traceHas(trace, "exhausted")],
-			["no install churn (one install only)", traceCount(trace, "oauth install") === 1],
-		],
-	},
-];
+			expect: ({ keys, trace, pi }) => [
+				["pi reported the overload", pi.code !== 0 || /overload/i.test(`${pi.stdout}\n${pi.stderr}`)],
+				["zero rotations", traceCount(trace, "rotate") === 0],
+				["trace: overload branch", traceHas(trace, "overload kroauth")],
+				["no exhaustion", !traceHas(trace, "exhausted")],
+				["no install churn (one install only)", traceCount(trace, "oauth install") === 1],
+			],
+		},
+		// -------------------------------------------------------------------------
+		{
+			// THE REGRESSION CASE. pi refreshes lazily and writes the rotated pair only
+			// to its own store. keyrouter holds its own copy of each account, so if a
+			// capture is not written back, installs keep presenting the access token
+			// from an account's LAST LOGIN (~1h of life). After any real use that token
+			// is expired and every account in the pool looks dead.
+			//
+			// The fixture models this exactly: account a1 starts expired, pi refreshes
+			// it on first use, and this asserts the refreshed value reached the pool's
+			// CONFIG FILE, not just memory.
+			name: "oauth-persists-refreshed-credential-to-config",
+			config: "accounts-expiring-first",
+			oauth: true,
+			auth: authJson(),
+			plan: { default: "ok", text: "PONG" },
+			expect: ({ keys, trace, pi, configAfter }) => {
+				const a1 = configAfter?.providers?.[0]?.accounts?.[0]?.credential;
+				return [
+					["pi recovered", /PONG/.test(pi.stdout)],
+					["pi refreshed the expired account", /oauth:refreshed-/.test(String(keys[0]))],
+					["the refreshed credential was written back to keyrouter.json", typeof a1?.access === "string" && a1.access.startsWith("refreshed-")],
+					["the persisted expiry moved forward, not left at login time", typeof a1?.expires === "number" && a1.expires > Date.now()],
+					["the refresh token was carried through", typeof a1?.refresh === "string" && a1.refresh.startsWith("refresh-")],
+					["the write was traced", traceHas(trace, "persist kroauth a1")],
+				];
+			},
+		},
+		// -------------------------------------------------------------------------
+		{
+			// The write must not run when nothing changed: pi refreshes lazily, so most
+			// captures are no-ops, and a needless write would churn the user's file.
+			name: "oauth-does-not-churn-config-when-nothing-changed",
+			config: "accounts",
+			oauth: true,
+			auth: authJson(),
+			plan: { default: "ok", text: "PONG" },
+			expect: ({ trace, pi }) => [
+				["pi recovered", /PONG/.test(pi.stdout)],
+				["pi did not need to refresh (credentials are far from expiry)", !traceHas(trace, "refresh")],
+				["nothing was persisted", !traceHas(trace, "persist kroauth")],
+			],
+		},
+	];

@@ -197,6 +197,98 @@ export function parseAccountCredential(
 	return validateCredential(parsed);
 }
 
+/**
+ * Write a refreshed OAuth credential back into `keyrouter.json`, in place.
+ *
+ * WHY THIS EXISTS: pi owns refresh and persists the rotated access/refresh pair
+ * to `auth.json`. keyrouter keeps its own copy of each account, and when it
+ * installs account #2 it OVERWRITES what pi had stored — so a token pi refreshed
+ * is lost unless the pool copy is updated first. Without this, every return to an
+ * account would present the access token that was current at the last LOGIN
+ * (typically ~1 hour of life), which after any real use is already expired, and
+ * the account would appear dead.
+ *
+ * Note this matters even though Cline does not rotate refresh tokens: the
+ * ACCESS token is what expires, and it is the access token that must be carried
+ * forward.
+ *
+ * Rules that keep this safe:
+ *   - Only accounts written as an INLINE OBJECT are eligible. An `@file` or
+ *     `$ENV` credential is the user's own indirection, so leave it alone.
+ *   - Only the four credential fields are touched. Every other field — including
+ *     provider-specific ones such as `accountId` or `projectId` — is preserved,
+ *     as is the rest of the file, its key order, and its 2-space formatting.
+ *   - The write is atomic (temp file + rename) so an interrupted write cannot
+ *     truncate a file holding live credentials.
+ *   - The write is skipped when nothing changed, so a no-op load never rewrites
+ *     the user's config.
+ *   - A write failure is reported, never thrown: persistence is an optimization,
+ *     and losing it must not break a session.
+ *
+ * @returns the number of accounts updated (0 when there was nothing to do)
+ */
+export function writeBackCredentials(
+	updates: ReadonlyMap<string, OAuthCredential>,
+	home?: string,
+): { updated: number } | { error: string } {
+	if (updates.size === 0) return { updated: 0 };
+	if (!configPath(undefined, home)) return { updated: 0 };
+	const file = configPath(undefined, home);
+
+	let rawText: string;
+	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
+	try {
+		rawText = fs.readFileSync(file, "utf-8");
+		parsed = JSON.parse(rawText) as typeof parsed;
+	} catch (error) {
+		return { error: `cannot read ${file}: ${(error as Error).message}` };
+	}
+
+	let updated = 0;
+	for (const provider of parsed.providers ?? []) {
+		if (typeof provider?.name !== "string") continue;
+		const providerId = provider.name;
+		const accounts = provider.accounts;
+		if (!Array.isArray(accounts)) continue;
+		for (const account of accounts) {
+			if (typeof account !== "object" || account === null) continue;
+			const entry = account as Record<string, unknown>;
+			if (typeof entry.name !== "string") continue;
+			const incoming = updates.get(`${providerId}\u0000${entry.name}`);
+			if (!incoming) continue;
+			// Only rewrite an inline object. A string form is the user's own `$ENV`
+			// or `@file` reference, which must keep working the way they chose.
+			const current = entry.credential;
+			if (typeof current !== "object" || current === null || Array.isArray(current)) {
+				continue;
+			}
+			const merged = { ...(current as Record<string, unknown>), ...incoming };
+			if (JSON.stringify(merged) === JSON.stringify(current)) continue;
+			entry.credential = merged;
+			updated += 1;
+		}
+	}
+
+	if (updated === 0) return { updated: 0 };
+
+	// Atomic replace: write beside the target, then rename over it, so a crash
+		// mid-write cannot leave a truncated file holding live credentials.
+	const temp = `${file}.keyrouter.tmp`;
+	const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
+	try {
+		fs.writeFileSync(temp, serialized, { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(temp, file);
+	} catch (error) {
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			// best effort cleanup
+		}
+		return { error: `cannot write ${file}: ${(error as Error).message}` };
+	}
+	return { updated };
+}
+
 export function defaultConfig(): KeyRouterConfig {
 	return {
 		providers: [],
