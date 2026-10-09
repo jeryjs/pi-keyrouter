@@ -21,12 +21,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: https://registry.npmjs.org
-          # The default cache keys on the lockfile and needs a matching npm
-          # version at install time; we only publish, so it buys nothing here.
+          # No registry-url here: this job only typechecks, it never publishes, so
+          # it has no use for npm auth.
           package-manager-cache: false
+      - run: npm ci
       # npm's own script shells out to `bun`, which is not on the runner, so
-      # invoke tsc directly here.
+      # invoke tsc directly here. Without the install above, `npx tsc` resolves
+      # the deprecated `tsc` stub on the registry rather than TypeScript.
       - run: npx tsc --noEmit -p tsconfig.json
       # The tag is the release version. Publishing a mismatched version would
       # burn the tag, because npm versions are immutable.
