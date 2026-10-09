@@ -22,6 +22,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [1.3.2] — 2026-10-09
+
+### Changed
+
+- **The publish workflow targets current runner and toolchain versions.**
+  `actions/checkout` and `actions/setup-node` move to `v6` and Node to `24`.
+  Trusted publishing requires npm >= 11.5.1 and Node >= 22.14.0, so pinning `24`
+  clears both floors deliberately rather than relying on whatever an unpinned
+  `22` happens to resolve to. `package-manager-cache: false` drops a cache that
+  is keyed off the lockfile and buys nothing in a job whose only real step is
+  `npm publish`.
+
+  This release exists to validate the trusted publisher configured for this
+  package, which only binds to the repository on a successful OIDC publish —
+  and to carry provenance, which trusted publishing generates automatically but
+  which was absent from `1.3.1` because that version did not go through the
+  workflow.
+
 ## [1.3.1] — 2026-10-09
 
 ### Changed
@@ -343,9 +361,9 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...v1.3.1
-[1.3.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.3.0
 [1.2.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.0.0...v1.1.0

@@ -1,6 +1,6 @@
 {
   "name": "@jeryjs/pi-keyrouter",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Credential pools for pi. Automatically rotate api keys and oauth credentials for built-in providers on 429 failovers in pi-coding-agent. No custom providers, no fetch hacks.",
   "keywords": [
     "pi",
