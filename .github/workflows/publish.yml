@@ -17,11 +17,14 @@ jobs:
     # rather than after the version is immutable on the registry.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: "22"
-      - run: npm ci
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          # The default cache keys on the lockfile and needs a matching npm
+          # version at install time; we only publish, so it buys nothing here.
+          package-manager-cache: false
       # npm's own script shells out to `bun`, which is not on the runner, so
       # invoke tsc directly here.
       - run: npx tsc --noEmit -p tsconfig.json
@@ -53,11 +56,15 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          # Trusted publishing requires npm >= 11.5.1 and Node >= 22.14.0.
+          # setup-node's "24" resolves to a current 24.x, comfortably clear of
+          # both floors rather than relying on an unpinned minor.
+          node-version: "24"
           registry-url: https://registry.npmjs.org
-      # --provenance attests the tarball was built from this commit in this
-      # workflow. Requires the id-token permission above.
+          package-manager-cache: false
+      # Provenance is generated automatically when publishing via Trusted
+      # Publishing, so the flag is belt-and-braces rather than required.
       - run: npm publish --provenance --access public
