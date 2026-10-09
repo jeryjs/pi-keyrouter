@@ -1,50 +1,7 @@
 {
   "name": "@jeryjs/pi-keyrouter",
   "version": "1.3.1",
-  "author": {
-    "name": "jeryjs",
-    "url": "https://github.com/jeryjs"
-  },
-  "contributors": [
-    {
-      "name": "lowern1ght",
-      "url": "https://github.com/lowern1ght"
-    }
-  ],
   "description": "Credential pools for pi. Automatically rotate api keys and oauth credentials for built-in providers on 429 failovers in pi-coding-agent. No custom providers, no fetch hacks.",
-  "type": "module",
-  "main": "index.ts",
-  "scripts": {
-    "test": "node test/fake-openai-server.mjs --selftest && node test/unit-oauth.mjs && node test/run.mjs",
-    "test:e2e": "node test/run.mjs",
-    "test:unit": "node test/unit-oauth.mjs",
-    "test:probe": "node test/verify-runtime-credentials.mjs",
-    "typecheck": "bun x tsc --noEmit -p tsconfig.json"
-  },
-  "dependencies": {},
-  "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@types/node": "^25.9.1",
-    "bun-types": "^1.3.14",
-    "typescript": "^6.0.3"
-  },
-  "files": [
-    "README.md",
-    "CHANGELOG.md",
-    "index.ts",
-    "config.ts",
-    "oauth.ts",
-    "rotation.ts",
-    "notification.ts",
-    "types.ts"
-  ],
   "keywords": [
     "pi",
     "pi-package",
@@ -67,15 +24,6 @@
     "rotation",
     "workarounds"
   ],
-  "license": "MIT",
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
-  },
   "homepage": "https://github.com/jeryjs/pi-keyrouter#readme",
   "bugs": {
     "url": "https://github.com/jeryjs/pi-keyrouter/issues"
@@ -83,5 +31,57 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jeryjs/pi-keyrouter.git"
+  },
+  "license": "MIT",
+  "author": "jeryjs (https://github.com/jeryjs)",
+  "contributors": [
+    {
+      "name": "lowern1ght",
+      "url": "https://github.com/lowern1ght"
+    }
+  ],
+  "type": "module",
+  "main": "index.ts",
+  "directories": {
+    "doc": "docs",
+    "test": "test"
+  },
+  "files": [
+    "README.md",
+    "CHANGELOG.md",
+    "index.ts",
+    "config.ts",
+    "oauth.ts",
+    "rotation.ts",
+    "notification.ts",
+    "types.ts"
+  ],
+  "scripts": {
+    "test": "node test/fake-openai-server.mjs --selftest && node test/unit-oauth.mjs && node test/run.mjs",
+    "test:e2e": "node test/run.mjs",
+    "test:unit": "node test/unit-oauth.mjs",
+    "test:probe": "node test/verify-runtime-credentials.mjs",
+    "typecheck": "bun x tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@types/node": "^25.9.1",
+    "bun-types": "^1.3.14",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
