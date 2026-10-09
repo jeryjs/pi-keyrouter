@@ -195,6 +195,18 @@ const CONFIGS = {
 			{ name: "ghost-not-registered", keys: [{ name: "G", value: "sk-g" }] },
 		],
 	},
+	// The same pool with a saved `active` position: a previous session rotated off
+	// A, so this one must resume there instead of restarting at the first key.
+	"abc-resume": {
+		providers: [{ name: "krtest", active: "B", keys: [{ name: "A", value: "sk-a" }, { name: "B", value: "sk-b" }] }],
+	},
+	// `active` naming an entry that no longer exists: must fall back to the first
+	// entry rather than pick something arbitrary or fail.
+	"abc-stale-active": {
+		providers: [
+			{ name: "krtest", active: "deleted-key", keys: [{ name: "A", value: "sk-a" }, { name: "B", value: "sk-b" }] },
+		],
+	},
 	// Keys from the environment, plus a pool referencing a missing variable.
 	env: {
 		providers: [
@@ -480,6 +492,42 @@ const cases = [
 			// 429 is retried by pi, but the following 401 is not: that leg needs
 			// exactly one settle-time continuation to reach sk-c.
 			["exactly one continuation", traceCount(trace, "continue ") === 1],
+		],
+	},
+	{
+		name: "resumes-saved-active-key",
+		config: "abc-resume",
+		plan: { default: "ok", text: "PONG" },
+		expect: ({ keys, trace, pi }) => [
+			["pi printed PONG", pi.code === 0 && /PONG/.test(pi.stdout)],
+			["exactly one request", keys.length === 1],
+			["it used sk-b (the saved position), not sk-a", keys[0] === "sk-b", keys.join(",")],
+			["trace: bootstrap krtest -> B", traceHas(trace, "bootstrap krtest -> B")],
+			["no rotation (B is healthy)", traceCount(trace, "rotate") === 0],
+		],
+	},
+	{
+		name: "stale-active-falls-back-to-first",
+		config: "abc-stale-active",
+		plan: { default: "ok", text: "PONG" },
+		expect: ({ keys, trace, pi }) => [
+			["pi printed PONG", pi.code === 0 && /PONG/.test(pi.stdout)],
+			["it used sk-a (the first entry)", keys[0] === "sk-a", keys.join(",")],
+			["trace: bootstrap krtest -> A", traceHas(trace, "bootstrap krtest -> A")],
+		],
+	},
+	{
+		name: "rotation-saves-active-key",
+		config: "abc",
+		plan: { byKey: { "sk-a": 429 }, default: "ok", text: "PONG" },
+		expect: ({ keys, trace, pi, configAfter }) => [
+			["pi recovered and printed PONG", /PONG/.test(pi.stdout)],
+			["rotated off sk-a onto sk-b", keys.includes("sk-b")],
+			// Saved at the rotation itself, not at shutdown: a session that died
+			// mid-rotation would still leave the right position behind.
+			["the active key was written back to the config", configAfter?.providers?.[0]?.active === "B", JSON.stringify(configAfter?.providers?.[0])],
+			["only the name is stored", JSON.stringify(configAfter?.providers?.[0]?.active) === '"B"'],
+			["the pool's keys are unchanged", configAfter?.providers?.[0]?.keys?.length === 3],
 		],
 	},
 	{

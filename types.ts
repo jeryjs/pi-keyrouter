@@ -62,6 +62,12 @@ export interface ProviderConfig {
 	 * limit that switching keys cannot lift.
 	 */
 	rotateOnQuota?: boolean;
+	/**
+	 * Name of the entry that was active when the last session ended. Read back so
+	 * the next session resumes here instead of restarting at the first entry.
+	 * keyrouter writes this field itself; the user never sets it.
+	 */
+	active?: string;
 }
 
 /** Top-level config. */

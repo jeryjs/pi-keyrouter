@@ -18,9 +18,39 @@ from the repository history directly.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] — 2026-10-09
 
-Nothing yet.
+### Fixed
+
+- **Rotation now survives a session, so a rotated pool no longer restarts on its
+  first key.** `activate()` bootstrapped from a hardcoded preferred index of `0`
+  and nothing was written to disk, so every new session began on entry #1 and had
+  to rediscover the failures that had moved the pool off it. Each pool now
+  records the entry it ended on in an `active` field, and the next session
+  resumes there — falling forward to the next available entry when that one is on
+  cooldown.
+
+  A **name** rather than an index, because the config moves under you: reordering
+  or inserting entries shifts every index after it, while a name still identifies
+  the intended credential. An entry that has since been renamed or deleted is
+  unknown, and the pool starts at its first entry — the previous behaviour.
+
+  keyrouter writes only the name, never a key value or token. The write is atomic
+  (temp file + rename), is skipped when the position is unchanged so a session
+  that never rotates never touches the file, and leaves the rest of the config —
+  including key order and formatting — exactly as it found it. A failure warns
+  once and rotation continues, as with the credential write-back.
+
+  Cooldowns are deliberately *not* carried over: they are per-session facts, and
+  honouring a 60-second cooldown from a session hours ago would only keep a
+  healthy key out of the pool.
+
+- **`/keyrouter reset` now clears the saved position.** Without this it was a
+  no-op for the next session, which resumed straight back onto the credential the
+  command had just handed back to pi.
+
+- **`/keyrouter account <provider> <name>` now survives a restart**, since a
+  manual pin is saved as the pool's `active` like any other rotation.
 
 ## [1.1.1] — 2026-10-06
 
@@ -261,7 +291,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jeryjs/pi-keyrouter/compare/v0.4.0...v1.0.0

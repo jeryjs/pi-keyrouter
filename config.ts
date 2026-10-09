@@ -289,6 +289,68 @@ export function writeBackCredentials(
 	return { updated };
 }
 
+/**
+ * Write the active entry's name back into `keyrouter.json`, in place.
+ *
+ * This is what makes rotation survive a session: without it every session
+ * restarts on entry #1 and has to rediscover the failures that moved the pool off
+ * it. Same safety rules as `writeBackCredentials` — only the one field changes,
+ * the rest of the file keeps its order and formatting, the write is atomic, it is
+ * skipped when nothing moved, and a failure is reported rather than thrown.
+ *
+ * A NAME, not an index: the user edits this file, and reordering or inserting
+ * entries shifts every index after it. An entry that has since been renamed or
+ * deleted simply fails to match at read time and the pool starts at the first
+ * entry, which is the correct fallback.
+ *
+ * @returns the number of pools updated (0 when there was nothing to do)
+ */
+export function writeBackActive(
+	providerName: string,
+	entryName: string | undefined,
+	home?: string,
+): { updated: number } | { error: string } {
+	const file = configPath(undefined, home);
+	let rawText: string;
+	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
+	try {
+		rawText = fs.readFileSync(file, "utf-8");
+		parsed = JSON.parse(rawText) as typeof parsed;
+	} catch (error) {
+		return { error: `cannot read ${file}: ${(error as Error).message}` };
+	}
+
+	let updated = 0;
+	for (const provider of parsed.providers ?? []) {
+		if (provider?.name !== providerName) continue;
+		if (entryName === undefined) {
+			// Forget the position (`/keyrouter reset`) rather than store a null, so the
+			// field only ever holds a real entry name.
+			if (provider.active === undefined) continue;
+			delete provider.active;
+		} else {
+			if (provider.active === entryName) continue;
+			provider.active = entryName;
+		}
+		updated += 1;
+	}
+	if (updated === 0) return { updated: 0 };
+
+	const temp = `${file}.keyrouter.tmp`;
+	try {
+		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(temp, file);
+	} catch (error) {
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			// best effort cleanup
+		}
+		return { error: `cannot write ${file}: ${(error as Error).message}` };
+	}
+	return { updated };
+}
+
 export function defaultConfig(): KeyRouterConfig {
 	return {
 		providers: [],
@@ -372,6 +434,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				keys,
 				kind: "keys" satisfies PoolKind,
 				takeoverOAuth: raw.takeoverOAuth === true,
+				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
 			continue;
 		}
@@ -406,6 +469,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				// Each OAuth account is a separate subscription, so an account-level
 				// limit is exactly when the next account is wanted. Default true.
 				rotateOnQuota: raw.rotateOnQuota !== false,
+				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
 			continue;
 		}

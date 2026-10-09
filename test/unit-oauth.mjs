@@ -19,9 +19,8 @@ import { join } from "node:path";
 
 const { credentialStore, isOAuthCredential, installCredential, captureCredential, clearOverlay, hasStoredOAuthLogin } =
 	await import("../oauth.ts");
-const { parseAccountCredential, validateCredential, loadConfig, expandEnv, configPath } = await import(
-	"../config.ts"
-);
+const { parseAccountCredential, validateCredential, loadConfig, expandEnv, configPath, writeBackActive } =
+	await import("../config.ts");
 const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = await import("../rotation.ts");
 // Importing index.ts binds no pi APIs at module scope (the extension only
 // registers handlers inside its default export), so the pure command parser is
@@ -239,6 +238,7 @@ try {
 		byName.both?.kind === "keys" && (cfg.warnings ?? []).some((w) => /mutually exclusive/.test(w)),
 		JSON.stringify(cfg.warnings),
 	);
+	check("a pool with no active reads as undefined", byName.google?.active === undefined);
 	check(
 		"the dropped account produced a warning naming the account",
 		(cfg.warnings ?? []).some((w) => /"broken"/.test(w)),
@@ -249,6 +249,22 @@ try {
 		!(cfg.warnings ?? []).some((w) => w.includes("access-x") || w.includes("refresh-x")),
 		JSON.stringify(cfg.warnings),
 	);
+
+	// `active` — the position a previous session left off at — is read for both
+	// pool kinds, and only when it is a string.
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({
+			providers: [
+				{ name: "google", active: "backup", keys: [{ name: "primary", value: "sk-1" }] },
+				{ name: "openai", active: 42, keys: [{ name: "primary", value: "sk-2" }] },
+			],
+		}),
+		"utf8",
+	);
+	const activeCfg = loadConfig();
+	check("active is read back", activeCfg.providers[0]?.active === "backup");
+	check("a non-string active is ignored", activeCfg.providers[1]?.active === undefined);
 
 	// rotateOnQuota: false is honoured.
 	writeFileSync(
@@ -431,6 +447,35 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	// An unknown provider/account key is silently skipped.
 	const ghost = writeBackCredentials(new Map([["ghost\u0000a9", VALID]]));
 	check("an unknown pool is a no-op", ghost.updated === 0);
+
+	// --- active: the saved rotation position ------------------------------
+	// Written back as a field on the pool itself, so a rotation survives a
+	// session: without it every session restarts at entry #1.
+	writeFileSync(
+		persistFile,
+		JSON.stringify(
+			{ ...seed, providers: [...seed.providers, { name: "google", keys: [{ name: "primary", value: "sk-g" }] }] },
+			null,
+			2,
+		) + "\n",
+		"utf8",
+	);
+	check("writeBackActive reports success", writeBackActive("cline", "a2").updated === 1);
+	let active = JSON.parse(readFileSync(persistFile, "utf8"));
+	check("active names the entry", active.providers[0].active === "a2");
+	check("active is per-pool (sibling pools untouched)", active.providers[1].active === undefined);
+	check(
+		"writeBackActive leaves credentials, keys and other fields alone",
+		active.providers[0].accounts[0].credential.access === "old-access" &&
+			active._customTopLevelField === "must-survive" &&
+			active.maxRetries === 3,
+	);
+	check("an unchanged active is a no-op", writeBackActive("cline", "a2").updated === 0);
+	check("an unknown pool is a no-op for active", writeBackActive("ghost", "x").updated === 0);
+	check("clearing active forgets it", writeBackActive("cline", undefined).updated === 1);
+	active = JSON.parse(readFileSync(persistFile, "utf8"));
+	check("clearing leaves no active field", active.providers[0].active === undefined);
+	check("clearing an already-unset active is a no-op", writeBackActive("cline", undefined).updated === 0);
 
 	delete process.env.PI_KEYROUTER_CONFIG;
 	} finally {

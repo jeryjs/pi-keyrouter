@@ -35,7 +35,7 @@
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync } from "node:fs";
-import { loadConfig, configPath, writeBackCredentials } from "./config.ts";
+import { loadConfig, configPath, writeBackCredentials, writeBackActive } from "./config.ts";
 import {
 	notifyRotation,
 	notifyOverloaded,
@@ -170,6 +170,8 @@ interface ProviderRuntime {
 	 * -1 = none set yet.
 	 */
 	currentIndex: number;
+	/** Index this session bootstraps from: the pool's `active` entry, else 0. */
+	resumeIndex: number;
 	/**
 	 * True once we have written into pi for this provider.
 	 * - keys pool:  an override is installed (needs removing on shutdown).
@@ -248,6 +250,15 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					? initAccountStates(providerCfg.accounts ?? [])
 					: initKeyStates(providerCfg.keys ?? []),
 			currentIndex: -1,
+			// Resume where the last session left off. Kept apart from `currentIndex`
+			// because that field's -1 is the "nothing installed yet" sentinel
+			// `activate` tests before bootstrapping.
+			resumeIndex: Math.max(
+				0,
+				(providerCfg.keys ?? providerCfg.accounts ?? []).findIndex(
+					(entry) => entry.name === providerCfg.active,
+				),
+			),
 			injecting: false,
 			pendingContinue: false,
 			continuations: 0,
@@ -505,6 +516,35 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * Make an entry the active one, in memory and in the config.
+	 *
+	 * Every change of `currentIndex` goes through here, so no rotation path can
+	 * forget to save the position: becoming active IS the save. Written at the
+	 * mutation rather than at handler exit, so a session that dies mid-rotation
+	 * still leaves the right position behind.
+	 *
+	 * Best effort, like the credential write-back: a failure warns once and
+	 * rotation continues. Only the entry NAME is written, never a credential.
+	 */
+	function setActive(rt: ProviderRuntime, idx: number): void {
+		rt.currentIndex = idx;
+		const result = writeBackActive(rt.configName, idx >= 0 ? rt.keys[idx]?.name : undefined);
+		if ("error" in result) {
+			trace(`persist active failed ${rt.providerId} (${result.error})`);
+			if (!persistNotifyErrorNotified) {
+				persistNotifyErrorNotified = true;
+				uiCtx?.notify(
+					`🔑 keyrouter: could not save the active key to ${configPath()} — ${result.error}. ` +
+						"Rotation still works; the next session will start at the first key.",
+					"warning",
+				);
+			}
+			return;
+		}
+		if (result.updated > 0) trace(`persist active ${rt.providerId} -> ${rt.keys[idx]?.name ?? "(none)"}`);
+	}
+
+	/**
 	 * Hand the provider back to whatever it had before this session started.
 	 *
 	 * Only a credential that was actually present at session start is restored.
@@ -588,7 +628,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				injected.delete(providerId);
 			}
 
-			const idx = pickNextKey(rt.keys, 0, Date.now());
+			const idx = pickNextKey(rt.keys, rt.resumeIndex, Date.now());
 			if (idx < 0) continue;
 			const key = rt.keys[idx];
 			if (!key) continue;
@@ -600,7 +640,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				rt.sessionStartCredential = storeApi
 					? await captureCredential(storeApi, providerId)
 					: undefined;
-				rt.currentIndex = idx;
+				setActive(rt, idx);
 				recordUse(key);
 				if (await applyAccount(providerId, key, ctx)) {
 					// Capture again: pi may have merged or normalized the blob, and this is
@@ -612,7 +652,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				continue;
 			}
 
-			rt.currentIndex = idx;
+			setActive(rt, idx);
 			recordUse(key);
 			// This is the fix for the old bug: the initial key actually gets set.
 			if (await applyKey(providerId, key.value, ctx)) {
@@ -770,7 +810,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			await captureAccount(rt, currentKey);
 			// 2. Install the next account.
 			if (!(await applyAccount(providerId, nextKey, ctx))) return;
-			rt.currentIndex = nextIdx;
+			setActive(rt, nextIdx);
 			recordUse(nextKey);
 			// 3. Read it back: pi may normalize or merge the blob, and this copy is
 			//    what a later return to this account will install.
@@ -779,7 +819,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
 		} else {
 			if (!(await applyKey(providerId, nextKey.value, ctx))) return;
-			rt.currentIndex = nextIdx;
+			setActive(rt, nextIdx);
 			recordUse(nextKey);
 			rt.pendingContinue = wantsContinue;
 			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
@@ -971,7 +1011,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					const rt = runtimes.get(providerId);
 					if (rt) await restoreSessionStartAccount(providerId, rt);
 				}
-				for (const rt of runtimes.values()) rt.currentIndex = -1;
+				// Forget the saved position too, or the next session would resume
+				// straight back onto the key this command just handed back.
+				for (const rt of runtimes.values()) setActive(rt, -1);
 				injected.clear();
 				installedAccounts.clear();
 				activationNotified = false;
@@ -1068,7 +1110,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				// a chosen entry that the picker would immediately skip, and drop any
 				// pending continuation — the user is not waiting on a retry.
 				markOk(entry);
-				rt.currentIndex = idx;
+				setActive(rt, idx);
 				rt.pendingContinue = false;
 				recordUse(entry);
 				const noun = rt.kind === "oauth" ? "account" : "key";

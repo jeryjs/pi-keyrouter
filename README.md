@@ -76,7 +76,11 @@ credentials that must not be overridable by a repo you clone.
         { "name": "backup",  "value": "thk_live_..." }
       ],
       // Optional: inject pooled keys even when pi has a stored OAuth login.
-      "takeoverOAuth": false
+      "takeoverOAuth": false,
+      // Written and updated by keyrouter — the entry the last session ended on, so
+      // the next one resumes here instead of restarting at "primary".
+      // See "Resuming across sessions". Leave it out; it is not yours to set.
+      "active": "backup"
     }
   ],
   "maxRetries": 3,            // rotations per provider before giving up
@@ -123,6 +127,35 @@ Two consequences of pi's retry policy worth knowing:
   leg needs no continuation.)
 - **Failed requests are not visible to `after_provider_response`.** The OpenAI SDK throws on non-2xx,
   so pi's response hook never fires. That is why errors are read from `message_end`.
+
+### Resuming across sessions
+
+A rotation that lands on key #2 used to be forgotten when the session ended: the next one started
+back on key #1 and had to rediscover the 429. Each pool now records which entry was active in an
+`active` field, so the next session resumes there — falling forward to the next available entry if
+that one is currently on cooldown.
+
+```jsonc
+{
+  "providers": [{
+    "name": "tokenharbor",
+    "active": "jsjery123",              // ← keyrouter writes this; you don't
+    "keys": [
+      { "name": "jery99961",  "value": "$TOKENHARBOR_API_KEY" },
+      { "name": "jsjery123",  "value": "$TOKENHARBOR_API_KEY2" }
+    ]
+  }]
+}
+```
+
+It stores the entry **name**, not an index, because this file moves under you: reordering or
+inserting entries shifts every index after it, while a name still identifies the credential you
+meant. An entry that has since been renamed or deleted is simply unknown, and the pool starts at its
+first entry.
+
+Only the name is written — never a key value or a token. The write is atomic, is skipped when the
+position is unchanged, and `/keyrouter reset` deletes the field so the next session genuinely starts
+fresh.
 
 ---
 
@@ -222,8 +255,9 @@ optimization, not a requirement.
 shutdown (or `/keyrouter reset`) the credential that was stored when the session started is put
 back; if there was none, the active account is left installed, because that is still a valid login
 and logging you out would be worse. If pi is killed mid-session, `auth.json` simply holds a pool
-account — still a valid login, and the next session installs account #1 again. keyrouter keeps no
-side copy of your credentials anywhere.
+account — still a valid login, and the next session resumes the account the last one ended on (see
+[Resuming across sessions](#resuming-across-sessions)). keyrouter keeps no side copy of your
+credentials anywhere: the `active` field holds an account **name** only.
 
 **When a pool is exhausted**, the active account is left in place and pi surfaces the original
 error, rather than leaving you logged out.
@@ -243,6 +277,9 @@ error, rather than leaving you logged out.
 /keyrouter account <provider> [name|index]    pin a specific key or account
 ```
 
+`reset` also clears each pool's saved `active` position, so the next session starts at the first
+entry rather than resuming onto the credential you just handed back.
+
 `account` switches a pool to a specific credential, and works for either pool kind. It accepts an
 exact name, a case-insensitive name, or a 1-based index. With no name it reports the pool and the
 available choices:
@@ -258,11 +295,14 @@ A pinned credential has its **cooldown cleared** — a manual pick is deliberate
 one the automatic picker would immediately skip — and any pending retry is dropped. Rotation then
 continues from the pinned position on the next failure, so this is a nudge rather than a lock.
 Installs go through exactly the same path as automatic rotation, including capturing pi's rotated
-blob before leaving the previous credential.
+blob before leaving the previous credential. The pin is also saved as the pool's `active`, so it
+survives a restart.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and
-cooldown. For `accounts` pools it also shows how long the credential has left — never the token:
+cooldown. Counters and cooldowns are per-session; only the active position carries over, via the
+`active` field. For `accounts` pools it also shows how long the credential has left — never the
+token:
 
 ```
 cline (oauth, active: home, installed: yes, source: stored)
