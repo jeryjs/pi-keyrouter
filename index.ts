@@ -909,6 +909,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("keyrouter", {
 		description: "manage credential pools (status, reload, reset, account)",
+		getArgumentCompletions: (prefix) =>
+			commandCompletions(prefix, config?.providers ?? loadConfig().providers),
 		handler: async (args, ctx) => {
 			const parsed = parseCommandArgs(args);
 			const sub = parsed.sub;
@@ -1160,6 +1162,86 @@ export function parseCommandArgs(args: string): {
 	const usage =
 		sub === "account" ? "account <provider> [name|index]" : sub;
 	return { sub, args: rest, usage };
+}
+
+/** Descriptions shown next to each subcommand in the completion menu. */
+const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
+	status: "live pool state per provider",
+	reload: "re-read the config file",
+	reset: "hand providers back to pi's own credentials",
+	account: "pin a specific key or account",
+};
+
+/**
+ * Completions for the text after `/keyrouter`.
+ *
+ * Pure and exported for the same reason `parseCommandArgs` is: a completion menu
+ * only exists in the interactive TUI, so this is what the unit suite can drive.
+ *
+ * Offers the four subcommands, then — for `account` — the configured pool names,
+ * then the entries of the pool already named. Suggestions carry the whole
+ * command line in `value` because pi replaces the whole argument prefix, so the
+ * earlier tokens have to be echoed back. Returns null once the line is complete,
+ * which is how pi is told to stop suggesting.
+ */
+export function commandCompletions(
+	prefix: string,
+	pools: readonly ProviderPoolConfig[],
+): { value: string; label: string; description?: string }[] | null {
+	// Split into the tokens already finished and the one being typed. A trailing
+	// space is what says a token was finished — pi hands us the raw prefix, and
+	// "/keyrouter account " must offer pool names, not entries.
+	const parts = prefix.split(/\s+/);
+	const typing = !/\s$/.test(prefix) && prefix.length > 0;
+	// An empty prefix splits to [""], which must count as no finished token.
+	const done = (typing ? parts.slice(0, -1) : parts).filter(Boolean);
+	const current = (typing ? (parts[parts.length - 1] ?? "") : "").toLowerCase();
+	const items = (matches: { value: string; label: string; description?: string }[]) =>
+		matches.length > 0 ? matches : null;
+
+	// No token finished yet: completing the subcommand.
+	if (done.length === 0) {
+		return items(
+			SUBCOMMANDS.filter((candidate) => candidate.startsWith(current)).map((candidate) => ({
+				value: `${candidate} `,
+				label: candidate,
+				description: SUBCOMMAND_DESCRIPTIONS[candidate],
+			})),
+		);
+	}
+
+	// Only `account` takes operands; the rest are complete on their own.
+	if (done[0]?.toLowerCase() !== "account") return null;
+	if (done.length > 2) return null;
+
+	// Completing the pool name.
+	if (done.length === 1) {
+		return items(
+			pools
+				.filter((pool) => pool.name.toLowerCase().startsWith(current))
+				.map((pool) => ({
+					value: `account ${pool.name} `,
+					label: pool.name,
+					description: pool.kind === "oauth" ? "oauth pool" : "key pool",
+				})),
+		);
+	}
+
+	// Completing an entry of the pool named in `done[1]`.
+	const pool = pools.find((candidate) => candidate.name === done[1]);
+	if (!pool) return null;
+	const entries = pool.kind === "oauth" ? (pool.accounts ?? []) : (pool.keys ?? []);
+	return items(
+		entries
+			.filter((entry) => entry.name.toLowerCase().startsWith(current))
+			// No trailing space: this is the last token, and a space would only
+			// invite a fourth one that means nothing.
+			.map((entry) => ({
+				value: `account ${pool.name} ${entry.name}`,
+				label: entry.name,
+				description: pool.active === entry.name ? "active" : undefined,
+			})),
+	);
 }
 
 /**

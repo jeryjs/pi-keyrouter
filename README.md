@@ -280,6 +280,11 @@ error, rather than leaving you logged out.
 `reset` also clears each pool's saved `active` position, so the next session starts at the first
 entry rather than resuming onto the credential you just handed back.
 
+The completion menu fills the rest in: the four subcommands first, then the configured pools after
+`account`, then that pool's entries. Entry names are matched case-insensitively, and the pool's
+current `active` entry is labelled as such. Suggestions stop as soon as the command is complete, so
+`status` and `reload` never offer operands.
+
 `account` switches a pool to a specific credential, and works for either pool kind. It accepts an
 exact name, a case-insensitive name, or a 1-based index. With no name it reports the pool and the
 available choices:

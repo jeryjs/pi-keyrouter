@@ -25,7 +25,7 @@ const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = 
 // Importing index.ts binds no pi APIs at module scope (the extension only
 // registers handlers inside its default export), so the pure command parser is
 // reachable from a plain Node process.
-const { parseCommandArgs, SUBCOMMANDS } = await import("../index.ts");
+const { parseCommandArgs, commandCompletions, SUBCOMMANDS } = await import("../index.ts");
 
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -353,6 +353,69 @@ check(
 );
 check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
 check("status takes no operands, usage is just the subcommand", parseCommandArgs("status").usage === "status");
+
+// ---------------------------------------------------------------------------
+// 10. commandCompletions — the /keyrouter completion menu
+//
+// pi calls this with the raw text after the command name and replaces that whole
+// prefix with the chosen item's `value`, which is why each suggestion carries the
+// full line rather than just its own token.
+// ---------------------------------------------------------------------------
+const POOLS = [
+	{
+		name: "cline",
+		kind: "oauth",
+		accounts: [{ name: "work" }, { name: "home" }, { name: "work-laptop" }],
+		active: "home",
+	},
+	{ name: "tokenharbor", kind: "keys", keys: [{ name: "primary" }, { name: "backup" }], active: "primary" },
+];
+const compl = (prefix) => commandCompletions(prefix, POOLS);
+const labels = (prefix) => (compl(prefix) ?? []).map((item) => item.label);
+
+// Subcommands.
+check("an empty prefix offers every subcommand", labels("").join() === "status,reload,reset,account");
+check("a partial subcommand narrows the list", labels("re").join() === "reload,reset");
+check("subcommands are case-insensitive", labels("RE").join() === "reload,reset");
+check("a subcommand suggestion carries a trailing space", compl("st")[0].value === "status ");
+check("subcommands carry a description", /pool state/.test(compl("")[0].description ?? ""));
+check("no matching subcommand yields null", compl("zzz") === null);
+
+// After a subcommand, only `account` takes operands.
+check("a bare subcommand stops suggesting", compl("status ") === null);
+check("a chosen subcommand offers its pools", compl("account ").map((i) => i.label).join() === "cline,tokenharbor");
+check("reload takes no operands", compl("reload ") === null);
+check("reset takes no operands", compl("reset x") === null);
+
+// Pool names.
+check("pool names filter by prefix", compl("account to").map((i) => i.label).join() === "tokenharbor");
+check("pool names are case-insensitive", compl("account CL").map((i) => i.label).join() === "cline");
+check("a pool suggestion carries the whole line", compl("account ").find((i) => i.label === "cline").value === "account cline ");
+check("pools are labelled by kind", compl("account ").map((i) => i.description).join() === "oauth pool,key pool");
+check("an unknown pool yields null", compl("account nope") === null);
+
+// Entries, for either pool kind.
+check("entries of an oauth pool", compl("account cline ").map((i) => i.label).join() === "work,home,work-laptop");
+check("entries of a keys pool", compl("account tokenharbor ").map((i) => i.label).join() === "primary,backup");
+check("entries filter by prefix", compl("account cline wo").map((i) => i.label).join() === "work,work-laptop");
+check("entry names are case-insensitive", compl("account cline HO").map((i) => i.label).join() === "home");
+check("an entry suggestion carries the whole line", compl("account cline wo").find((i) => i.label === "work").value === "account cline work");
+check("no trailing space after the last token", !compl("account cline wo")[0].value.endsWith(" "));
+check("the active entry is labelled", compl("account cline ").find((i) => i.label === "home").description === "active");
+check("an inactive entry has no label", compl("account cline ").find((i) => i.label === "work").description === undefined);
+check("an unknown entry yields null", compl("account cline zz") === null);
+check("extra operands stop suggesting", compl("account cline work extra ") === null);
+
+// Must never throw on whatever the editor hands it.
+check("a null-ish prefix is safe", commandCompletions("", []).length === SUBCOMMANDS.length);
+// Whitespace-only still offers the subcommands: nothing has been chosen yet, and
+// offering them is harmless where offering entries for a blank pool name would
+// not be.
+check("a whitespace-only prefix still offers subcommands", labels("  ").join() === "status,reload,reset,account");
+check("a tab counts as a separator", compl("account\t").map((i) => i.label).join() === "cline,tokenharbor");
+check("an unknown subcommand offers nothing", compl("notacommand ") === null);
+check("an empty pool list yields null, not an empty menu", commandCompletions("account ", []) === null);
+check("an empty pool list still offers subcommands", commandCompletions("", []).length === SUBCOMMANDS.length);
 
 // ---------------------------------------------------------------------------
 // 10. writeBackCredentials — persisting a refreshed credential

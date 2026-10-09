@@ -18,6 +18,25 @@ from the repository history directly.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Nothing yet.
+
+## [1.3.0] — 2026-10-09
+
+### Added
+
+- **Tab-completion for `/keyrouter`.** The command now offers its four
+  subcommands, then the configured pool names after `account`, then that pool's
+  entries — so `/keyrouter account <TAB> <TAB>` reaches a credential without
+  typing or remembering its name. Entry matching is case-insensitive, pools are
+  labelled by kind (`key pool` / `oauth pool`), and the pool's current `active`
+  entry is marked. Completion stops once the command is complete, so `status`,
+  `reload` and `reset` never offer operands they do not take.
+
+  Pools come from the already-loaded config when there is one, and are read from
+  disk otherwise, so the menu works before the first turn of a session.
+
 ## [1.2.0] — 2026-10-09
 
 ### Fixed
@@ -291,7 +310,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.0.0...v1.1.0
