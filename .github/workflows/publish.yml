@@ -1,0 +1,55 @@
+name: Publish
+
+# Publishing is driven by a version tag, not by main. Combined with Trusted
+# Publishing (see below) this means npm never sees a long-lived secret: the
+# workflow authenticates over OIDC using its own short-lived identity token.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Gate the publish on a green typecheck. A broken release should fail here
+    # rather than after the version is immutable on the registry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      # npm's own script shells out to `bun`, which is not on the runner, so
+      # invoke tsc directly here.
+      - run: npx tsc --noEmit -p tsconfig.json
+      # The tag is the release version. Publishing a mismatched version would
+      # burn the tag, because npm versions are immutable.
+      - name: Tag matches package.json
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME is v$TAG but package.json is $VERSION"
+            exit 1
+          fi
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # Required: this mints the OIDC token npm exchanges for publish rights.
+      # Scoped to this job only.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      # --provenance attests the tarball was built from this commit in this
+      # workflow. Requires the id-token permission above.
+      - run: npm publish --provenance --access public

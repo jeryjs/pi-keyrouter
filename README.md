@@ -423,6 +423,18 @@ test/
 
 ---
 
+### Publishing
+
+Releases go out from `.github/workflows/publish.yml`, triggered by pushing a `v*` tag. The workflow
+typechecks first, fails if the tag does not match `package.json`, then publishes with
+`--provenance`.
+
+There is **no npm token in this repo**. npm no longer accepts TOTP 2FA, and is retiring
+bypass-2FA tokens for direct publishing, so publishing authenticates through **Trusted Publishing**:
+the job's OIDC identity (`permissions: id-token: write`) is exchanged by npm for publish rights. To
+set it up, add a trusted publisher on npm for the `@jeryjs` scope pointing at this repo and the
+`publish.yml` workflow.
+
 ## License
 
 MIT
