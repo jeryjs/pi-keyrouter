@@ -1,6 +1,6 @@
 {
-  "name": "pi-keyrouter",
-  "version": "1.3.0",
+  "name": "@jeryjs/pi-keyrouter",
+  "version": "1.3.1",
   "author": {
     "name": "jeryjs",
     "url": "https://github.com/jeryjs"
@@ -11,7 +11,7 @@
       "url": "https://github.com/lowern1ght"
     }
   ],
-  "description": "Credential pools for pi. Rotates API keys or stored OAuth logins inside providers you already have (built-in, models.json, or another extension's) on 429/401/403 and quota errors. Never registers its own provider; pi keeps auth, OAuth refresh and retries.",
+  "description": "Credential pools for pi. Automatically rotate api keys and oauth credentials for built-in providers on 429 failovers in pi-coding-agent. No custom providers, no fetch hacks.",
   "type": "module",
   "main": "index.ts",
   "scripts": {
@@ -25,7 +25,7 @@
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
@@ -43,20 +43,29 @@
     "oauth.ts",
     "rotation.ts",
     "notification.ts",
-    "types.ts",
-    "test/"
+    "types.ts"
   ],
   "keywords": [
     "pi",
-    "pi-extension",
     "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "typescript",
+    "api-key-rotation",
     "api-key",
+    "api-keys",
+    "authentication",
+    "credentials",
+    "failover",
+    "model-routing",
+    "multi-account",
     "oauth",
-    "key-rotation",
-    "account-rotation",
-    "credential-pool",
-    "fallback",
-    "ai-coding"
+    "oauth2",
+    "provider-agnostic",
+    "rate-limit",
+    "rate-limiting",
+    "rotation",
+    "workarounds"
   ],
   "license": "MIT",
   "pi": {
@@ -73,7 +82,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/jeryjs/pi-keyrouter.git",
-    "directory": "packages/pi-keyrouter"
+    "url": "git+https://github.com/jeryjs/pi-keyrouter.git"
   }
 }

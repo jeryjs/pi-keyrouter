@@ -14,10 +14,12 @@ this extension only chooses which credential pi resolves.
 > [CHANGELOG.md](./CHANGELOG.md).
 
 ```bash
-pi install git:github.com/jeryjs/pi-keyrouter   # or npm:jeryjs/pi-keyrouter once published
+pi install npm:@jeryjs/pi-keyrouter
 # create ~/.pi/keyrouter.json with your keys or accounts
 /reload
 ```
+
+Want to stay on top of the latest changes? `pi install git:github.com/jeryjs/pi-keyrouter` works too.
 
 ---
 
@@ -372,7 +374,6 @@ Slash commands only exist in the interactive TUI, so `/keyrouter account` cannot
 `--print` run. Its argument handling is therefore a pure exported function (`parseCommandArgs`)
 covered by `unit-oauth.mjs`, and the effect of a switch — including pi's refreshed-blob capture and
 the shutdown restore — is exercised live in the TUI and by the automatic-rotation cases.
-```
 
 `test/run.mjs` starts `test/fake-openai-server.mjs` on an OS-assigned free port, spawns real
 `pi --print` runs against an **isolated** agent dir and keyrouter config, and asserts on

@@ -22,6 +22,39 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [1.3.1] — 2026-10-09
+
+### Changed
+
+- **The npm package is now `@jeryjs/pi-keyrouter`.** The unscoped `pi-keyrouter`
+  name on npm belongs to the original author (`lowern1ght`, from the pi-soly
+  monorepo) and has been frozen at `0.4.0`, so the `1.x` line could never be
+  published under it. Install with `pi install npm:@jeryjs/pi-keyrouter`.
+
+- **Description and keywords now match the GitHub repository**, so the two do not
+  drift: the same one-line summary, and the repo's topics as package keywords.
+
+- **The test suite is no longer published.** It stays in git but is out of the npm
+  tarball. That halves the package (273 KB → 132 KB) and keeps files like
+  `test/fixture/agent/auth.json` out of a credential tool's published artifact —
+  they only ever held fixtures, but the name is not worth shipping.
+
+- **`repository.directory` dropped.** The repo root *is* the package; the
+  `packages/pi-keyrouter` path was inherited from the old monorepo and rendered
+  a broken link on the package page.
+
+- **`@earendil-works/pi-coding-agent` peer range is now `*`**, matching the other
+  host-provided packages. pi suppresses automatic peer installation, so a
+  `>=1.0.0` constraint bought nothing and could emit a peer warning.
+
+### Added
+
+- **`LICENSE.md`.** The package declared MIT in `package.json` but shipped no
+  license file, so npm's page and any tarball consumer had no terms. The original
+  project's notice — `Copyright (c) 2026 pi-extensions contributors` — is
+  retained, since MIT requires the notice to travel with the code, with the
+  fork's copyright added beneath it.
+
 ## [1.3.0] — 2026-10-09
 
 ### Added
@@ -310,8 +343,9 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.2.0...v1.3.0
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.3.0
 [1.2.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.0.0...v1.1.0
