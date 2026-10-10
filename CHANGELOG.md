@@ -22,6 +22,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [1.3.3] — 2026-10-09
+
+### Changed
+
+- **The hidden retry message no longer claims a credential rotation.** When a key
+  fails with an error pi does not retry — 401, 403, quota, a dead refresh token —
+  keyrouter rotates and appends a hidden message so `agent_before_settle` will
+  permit one more assistant turn. Without it the rotated credential would not be
+  used until the following turn.
+
+  That message was `"pi-keyrouter: the API key was rotated after the last failed
+  request. Retry the previous turn using the new credentials."` Pi maps a custom
+  message to a **user** turn in `convertToLlm`, so the model reads it — `display:
+  false` only hides it from the TUI. It was therefore telling the model that an
+  external credential change had occurred, which it cannot observe or verify, and
+  inviting it to narrate that back to the user. The message is now `"Retrying."`,
+  which still prompts the model to resume the turn, which is the part it needed,
+  without asserting anything untrue.
+
+  The mechanism is unaffected: pi's `canContinue` checks only the final message's
+  role, never its text.
+
 ## [1.3.2] — 2026-10-09
 
 ### Changed
@@ -361,7 +383,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...v1.3.1
 [1.2.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.1.1...v1.2.0

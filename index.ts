@@ -865,9 +865,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				{
 					type: "custom_message" as const,
 					customType: CONTINUATION_CUSTOM_TYPE,
-					content:
-						"pi-keyrouter: the API key was rotated after the last failed request. " +
-						"Retry the previous turn using the new credentials.",
+					content: "Retrying.",
 					display: false,
 				},
 			],
