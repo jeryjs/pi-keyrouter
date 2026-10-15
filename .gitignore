@@ -85,3 +85,10 @@ test/fixture/agent/models.json
 test/fixture/agent/models-store.json
 test/fixture/agent/settings.json
 test/fixture/pi-home/keyrouter.json
+
+# ---------------------------------------------------------------------------
+# Credential-sync watcher (instrumentation, not part of the extension)
+# The log it writes records raw access/refresh tokens verbatim, so this
+# directory must never be committed and must be deleted when done.
+# ---------------------------------------------------------------------------
+tools/sync-watch/logs
