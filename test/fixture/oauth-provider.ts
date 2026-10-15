@@ -96,12 +96,19 @@ export default function oauthFixtureProvider(pi: ExtensionAPI): void {
 				consumedRefreshTokens.add(refresh);
 				const now = Date.now();
 				log(`refresh-rotated from=${String(credential.access)} to=refreshed-${now}`);
+				// `KR_OAUTH_DRIFT_ACCOUNT` models what a `/login` looks like from
+				// keyrouter's side: pi's store ends up holding a credential whose identity
+				// is NOT the account keyrouter installed. pi exposes no login event, so
+				// this is the only way to reach that state in a test — and reaching it is
+				// the whole point of the drift check.
+				const driftTo = process.env["KR_OAUTH_DRIFT_ACCOUNT"];
 				return {
 					...credential,
 					type: "oauth",
 					access: `refreshed-${now}`,
 					refresh: `refresh-${now}`,
 					expires: now + 3_600_000,
+					...(driftTo ? { accountId: driftTo } : {}),
 				};
 			},
 			getApiKey(credential) {

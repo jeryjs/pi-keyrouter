@@ -28,7 +28,15 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { OAUTH_ACCOUNTS, OAUTH_ACCOUNTS_3, OAUTH_ACCOUNTS_DEAD_FIRST, OAUTH_ACCOUNTS_EXPIRING_FIRST, oauthCases } from "./oauth-cases.mjs";
+import {
+	OAUTH_ACCOUNTS,
+	OAUTH_ACCOUNTS_3,
+	OAUTH_ACCOUNTS_DEAD_FIRST,
+	OAUTH_ACCOUNTS_DEAD_ONLY,
+	OAUTH_ACCOUNTS_DEAD_SECOND,
+	OAUTH_ACCOUNTS_EXPIRING_FIRST,
+	oauthCases,
+} from "./oauth-cases.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -48,11 +56,20 @@ const OAUTH_LOG = join(ARTIFACTS, "oauth.log");
 const REAL_AUTH_JSON = join(homedir(), ".pi", "agent", "auth.json");
 
 /** Extra pi CLI options for OAuth cases. */
-const OAUTH_RUN_OPTS = {
+/**
+ * Extra pi CLI options for OAuth cases.
+ *
+ * `env` is a function of the case so a case can inject its own fixture knobs —
+ * `KR_OAUTH_DRIFT_ACCOUNT` is how a case reaches the state a `/login` produces.
+ */
+const OAUTH_RUN_OPTS = (c) => ({
 	extensions: [OAUTH_PROVIDER],
 	provider: "kroauth",
-	env: { KR_OAUTH_LOG: OAUTH_LOG },
-};
+	env: {
+		KR_OAUTH_LOG: OAUTH_LOG,
+		...(c.drift ? { KR_OAUTH_DRIFT_ACCOUNT: c.drift } : {}),
+	},
+});
 
 /**
  * Read the fixture's oauth log, if the case produced one.
@@ -222,6 +239,8 @@ const CONFIGS = {
 	// installed at session start, replacing anything seeded into auth.json.
 	"accounts-expiring-first": ACCOUNTS(OAUTH_ACCOUNTS_EXPIRING_FIRST),
 	"accounts-dead-first": ACCOUNTS(OAUTH_ACCOUNTS_DEAD_FIRST),
+	"accounts-dead-second": ACCOUNTS(OAUTH_ACCOUNTS_DEAD_SECOND),
+	"accounts-dead-only": ACCOUNTS(OAUTH_ACCOUNTS_DEAD_ONLY),
 	// rotateOnQuota disabled: a quota error must NOT rotate.
 	"accounts-no-quota": ACCOUNTS(OAUTH_ACCOUNTS, { rotateOnQuota: false }),
 	// Points an account pool at the API-key-only fixture provider. keyrouter must
@@ -793,7 +812,7 @@ async function main() {
 		// fixture's refresh hook writes here. Removed per case so a leftover log
 		// cannot make a later case look refreshed.
 		if (existsSync(OAUTH_LOG)) rmSync(OAUTH_LOG);
-		const pi = await runPi(c.env ?? {}, c.oauth ? OAUTH_RUN_OPTS : undefined);
+		const pi = await runPi(c.env ?? {}, c.oauth ? OAUTH_RUN_OPTS(c) : undefined);
 		const log = await serverRequestLog();
 		const trace = readTrace();
 		const ctx = {

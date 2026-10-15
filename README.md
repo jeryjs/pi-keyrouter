@@ -227,7 +227,11 @@ holds them and swaps them in.
 - `keys` and `accounts` are mutually exclusive for one provider.
 - `rotateOnQuota` (default `true`) decides whether an account-level limit rotates the pool. Each
   account is a separate subscription, so this defaults the opposite way from `keys` pools — see
+- `rotateOnQuota` (default `true`) decides whether an account-level limit rotates the pool. Each
+  account is a separate subscription, so this defaults the opposite way from `keys` pools — see
   [Rotation rules](#rotation-rules).
+- `identityPath` (optional) says where this provider's account identity lives inside a credential.
+  See [Attributing a refreshed credential](#attributing-a-refreshed-credential).
 
 **How it works.** keyrouter installs an account with pi's own credential store
 (`runtime.credentials.modify`), so pi's file lock, cache and revision counter all stay coherent.
@@ -252,6 +256,74 @@ write is skipped entirely when nothing moved, so a normal run never rewrites you
 atomic (temp file + rename), so an interrupted write cannot truncate a file holding live
 credentials. If the write fails you get one warning and the session continues — persistence is an
 optimization, not a requirement.
+### Attributing a refreshed credential
+
+When pi hands back a refreshed credential, keyrouter must decide **which pool account it belongs
+to** before writing it. It cannot simply use the `active` field: pi holds exactly one credential per
+provider, so if you `/login` as account A while the saved `active` still names slot B, `auth.json`
+holds A's token while the file says B. Writing it to the slot the pointer names would alias B onto
+A, orphan B's own refresh token, and make B fail with `invalid_grant` on its next use even though
+nothing had been wrong with it.
+
+So the credential is matched, strongest signal first:
+
+| # | Signal | Notes |
+|---|---|---|
+| 1 | your `identityPath` | authoritative; beats every guess below |
+| 2 | an identity claim decoded from a token field | `email`, `preferred_username`, `sub`, ... |
+| 3 | a known credential field | `accountId`, `projectId`, `userID`, `machineID`, `clientId` |
+| 4 | exact `refresh`-token equality | works on opaque credentials; tried late because it rotates |
+| 5 | the `active` pointer | only when keyrouter itself installed the credential |
+
+Levels 2 and 3 are best-effort by nature — providers do not agree on where an identity lives, and
+some credentials carry none at all. That is what `identityPath` is for.
+
+```json
+{
+  "name": "cline",
+  "identityPath": "access:email",
+  "accounts": [ /* ... */ ]
+}
+```
+
+The format is **`level1:level2`**:
+
+- **`level1`** — a key of the credential object: `access`, `refresh`, `accountId`, or a dotted path
+  for a nested field.
+- **`level2`** — a path into that value **after decoding it**. Optional: with no colon, `level1`'s own
+  value is compared as-is.
+
+Decoding is automatic and best-effort, because a credential may hold JSON, a JWT, a base64-wrapped
+blob, or nothing encoded at all:
+
+| `identityPath` | Meaning |
+|---|---|
+| `"refresh"` | compare the refresh token and nothing else |
+| `"access:email"` | decode `access`, read its `email` |
+| `"access:user.email"` | the same, for a nested claim |
+| `"accountId"` | compare the credential's own `accountId` |
+| `"accountId:sub"` | decode `accountId`, read its `sub` |
+
+The decode order is JWT → JSON → base64-wrapped-JSON, stopping at the first form that yields
+structure. A plain string that merely happens to be base64-decodable is **not** decoded: most opaque
+tokens are base64-ish, and decoding one would produce mojibake that would then be reported as an
+identity. Only a decode that produces real JSON is accepted.
+
+A path that resolves nowhere is almost always a typo. It is reported once, and detection falls back
+to the automatic levels — a typo must never stop refreshes from being persisted.
+
+Two safeguards apply when the signals are insufficient:
+
+- **Ambiguity is refused.** If two slots share the identity you named (two logins to one address, or a
+  coarse field like a shared `projectId`) and nothing sharper separates them, nothing is written.
+- **A mismatched slot is refused.** Before writing, the identity already stored in the target slot is
+  compared with the incoming one. If they name different accounts the write is skipped with a warning,
+  because the stored credential holds a refresh token that cannot be recovered. Only stable
+  identifiers are compared — the refresh token rotates, so including it would flag every legitimate
+  write as a conflict.
+
+Both refusals are logged to the trace sink and surfaced as a warning naming the provider, so a
+credential that stopped persisting is visible rather than silent.
 
 **Persistence.** The pool owns the provider credential while the extension is loaded. On a clean
 shutdown (or `/keyrouter reset`) the credential that was stored when the session started is put
@@ -367,7 +439,8 @@ node test/fake-openai-server.mjs --selftest  # the fake server's own plan engine
 node test/unit-oauth.mjs                     # config parsing, store guards, /keyrouter args (no pi needed)
 node test/verify-runtime-credentials.mjs     # probes pi's credential-store behaviour
 node test/oauth-fixture-smoke.mjs            # proves the OAuth fixture works WITHOUT keyrouter
-node test/run.mjs                            # end-to-end, 27 cases
+node test/unit-identity.mjs                  # credential->account attribution, incl. the incident replay
+node test/run.mjs                            # end-to-end, 32 cases
 ```
 
 Slash commands only exist in the interactive TUI, so `/keyrouter account` cannot be reached from a

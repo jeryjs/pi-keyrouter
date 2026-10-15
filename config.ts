@@ -69,6 +69,7 @@ import type {
 	PoolKind,
 	ProviderConfig as ProviderPool,
 } from "./types.ts";
+import { validateIdentityPath } from "./identity.ts";
 
 /**
  * Expand `$NAME` / `${NAME}` from the environment. `$$` is a literal `$`.
@@ -428,6 +429,13 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				warnings.push(`"${raw.name}": no usable keys after expansion — pool dropped.`);
 				continue;
 			}
+			if (raw.identityPath !== undefined) {
+				// Identity attribution only ever happens for an OAuth pool, where a
+				// credential is written back into a named account. An api-key pool has
+				// no such write, so the field is meaningless — say so rather than
+				// silently accepting a setting that changes nothing.
+				warnings.push(`"${raw.name}": "identityPath" applies only to "accounts" pools — ignored.`);
+			}
 			providers.push({
 				name: raw.name,
 				match: Array.isArray(raw.match) ? raw.match : [],
@@ -461,6 +469,15 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				warnings.push(`"${raw.name}": no usable accounts — pool dropped.`);
 				continue;
 			}
+
+			// Where this provider's account identity lives. Checked for structural
+			// sanity here; whether it RESOLVES depends on a credential that may not
+			// exist yet, so that check happens at use time and falls through with a
+			// warning rather than dropping the pool.
+			const identityPath = validateIdentityPath(raw.identityPath);
+			if (raw.identityPath !== undefined && !identityPath.ok) {
+				warnings.push(`"${raw.name}": "identityPath" ${identityPath.reason} — ignored.`);
+			}
 			providers.push({
 				name: raw.name,
 				match: Array.isArray(raw.match) ? raw.match : [],
@@ -469,6 +486,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				// Each OAuth account is a separate subscription, so an account-level
 				// limit is exactly when the next account is wanted. Default true.
 				rotateOnQuota: raw.rotateOnQuota !== false,
+				identityPath: identityPath.ok ? identityPath.path : undefined,
 				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
 			continue;

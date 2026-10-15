@@ -68,6 +68,24 @@ export interface ProviderConfig {
 	 * keyrouter writes this field itself; the user never sets it.
 	 */
 	active?: string;
+	/**
+	 * Where this provider's account identity lives inside a credential, so a
+	 * refreshed credential can be matched to the right account. Optional: leave it
+	 * unset and keyrouter uses the identity fields it recognises.
+	 *
+	 * Format is `level1:level2`. `level1` is a key of the credential object —
+	 * `access`, `refresh`, `accountId`, or a dotted path for a nested field.
+	 * `level2` is a path into that value AFTER decoding it (JSON, a JWT, or a
+	 * base64-wrapped payload are all handled). With no colon, `level1`'s own value
+	 * is compared as-is.
+	 *
+	 * Examples:
+	 *   "refresh"            compare the refresh token alone
+	 *   "access:email"       decode `access`, read its `email`
+	 *   "access:user.email"  the same, for a nested claim
+	 *   "accountId"          compare the credential's own `accountId`
+	 */
+	identityPath?: string;
 }
 
 /** Top-level config. */

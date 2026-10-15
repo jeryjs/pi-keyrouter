@@ -17,5 +17,5 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true
   },
-  "include": ["index.ts", "types.ts", "config.ts", "rotation.ts", "notification.ts"]
+  "include": ["index.ts", "types.ts", "config.ts", "rotation.ts", "notification.ts", "oauth.ts", "identity.ts"]
 }

@@ -50,6 +50,13 @@ import {
 	type CredentialStoreApi,
 } from "./oauth.ts";
 import {
+	attributeCredential,
+	checkTripwire,
+	detectIdentity,
+	identityLabel,
+	resolveUserPath,
+} from "./identity.ts";
+import {
 	initAccountStates,
 	initKeyStates,
 	isAvailable,
@@ -73,6 +80,23 @@ import type {
  * `ui.notify` has no terminal to print to.
  */
 const tracePath = process.env["PI_KEYROUTER_TRACE"] || undefined;
+
+/**
+ * `ui.notify` before a UI context exists is a silent no-op, so a warning raised during
+ * bootstrap has to be queued. `deepEqual` is its own exported helper.
+ *
+ * Same-credential captures are suppressed entirely. pi refreshes lazily, so a capture
+ * fires on every rotation attempt, and without this the queue would fill with repeats
+ * of one refusal and bury the first one — which is the only one that matters, because
+ * it is the one that names which account was nearly overwritten.
+ */
+function warn(ui: ExtensionUIContext | undefined, queue: string[], message: string, kind: "warning" | "error" | "info" = "warning"): void {
+	if (ui) {
+		ui.notify(message, kind);
+		return;
+	}
+	if (queue.length === 0 || queue[queue.length - 1] !== message) queue.push(message);
+}
 
 function trace(message: string): void {
 	if (!tracePath) return;
@@ -179,12 +203,10 @@ interface ProviderRuntime {
 	 */
 	injecting: boolean;
 	/**
-	 * OAuth pools only: the credential that was in the store when this session
-	 * started, so it can be restored on clean shutdown. `undefined` means the
-	 * provider had no stored credential, in which case shutdown leaves the pool's
-	 * active account installed rather than logging the user out.
+	 * Where this provider's account identity lives, from the config's
+	 * `identityPath`. Unset means "use the built-in detection".
 	 */
-	sessionStartCredential?: KeyState["credential"];
+	identityPath?: string | undefined;
 	/**
 	 * Set after a rotation that no request has used yet. pi does not retry
 	 * 401/403 (or quota/refresh failures), so `agent_before_settle` must ask for
@@ -213,6 +235,16 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let uiCtx: ExtensionUIContext | undefined;
 	/** Providers whose config error we have already reported once. */
 	const skipReported = new Set<string>();
+	/**
+	 * Warnings raised before a UI context exists.
+	 *
+	 * An OAuth pool bootstraps during `before_agent_start`, which runs BEFORE `ui.notify`
+	 * is usable — `uiCtx` is only assigned later in that same function. Anything warned
+	 * during bootstrap was therefore discarded, and the identity refusals below happen at
+	 * exactly that moment. Buffering them and flushing once the UI is ready is the
+	 * difference between a loud refusal and a silent one.
+	 */
+	const earlyWarnings: string[] = [];
 	/** Providers that can never be managed (OAuth-only): stop re-checking. */
 	const permanentSkip = new Set<string>();
 	let activationNotified = false;
@@ -224,8 +256,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	let lastErrorNotified = false;
 	/** Config warnings are reported once per config load. */
 	let warningsReported = false;
-	/** Reported once if refreshed credentials cannot be written back to disk. */
 	let persistNotifyErrorNotified = false;
+	// `identityConflictNotified` was removed: refusals are now collapsed by `warn`,
+	// which suppresses a repeat of the immediately preceding message. A single
+	// boolean could only ever report the first refusal across ALL providers, so a
+	// second provider's problem was silently swallowed.
+	/** Providers whose configured `identityPath` did not resolve, reported once each. */
+	const identityPathReported = new Set<string>();
 
 	/**
 	 * Get-or-create the runtime for a provider, keyed by the real provider id.
@@ -242,6 +279,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			// canonicalized it (`z-ai` -> `zai`) and the config is never rewritten to
 			// the canonical form.
 			configName: providerCfg.name,
+			// Only a `accounts` pool can carry one, and only it can use one.
+			identityPath: providerCfg.identityPath,
 			kind: providerCfg.kind,
 			// Only meaningful for OAuth pools; false for keys pools by construction.
 			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
@@ -460,12 +499,42 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Read the live credential back into the pool entry we are leaving.
+	 * Read the live credential back into the pool, writing it to whichever slot the
+	 * credential actually belongs to.
 	 *
-	 * pi rotates refresh tokens in place, so a stale pool copy would install a
-	 * consumed refresh token on a later return to that account — burning an
-	 * account that was perfectly healthy. This is why capture happens both before
-	 * swapping away and after installing.
+	 * pi rotates tokens in place, so a stale pool copy would install a consumed
+	 * refresh token on a later return to that account — burning an account that was
+	 * perfectly healthy. This is why capture happens both before swapping away and
+	 * after installing.
+	 *
+	 * `entry` is the slot the CALLER BELIEVES owns this credential. It is used only
+	 * to validate the last-resort fallback, never to short-circuit attribution:
+	 * assuming the caller is right is what corrupted two accounts. When pi's store
+	 * holds a credential keyrouter did not install — after `/login` for account A
+	 * while the saved `active` still names slot B — writing to `entry` aliases B
+	 * onto A and orphans B's refresh token, which is unrecoverable.
+	 *
+	 * IMPORTANT: capturing into memory is not enough on its own. pi refreshes a
+	 * credential in place, but when keyrouter later installs a DIFFERENT account it
+	 * overwrites what pi stored — so the refreshed pair only survives if it is
+	 * written back to the config. Without that, a return to this account would
+	 * present the access token from its last login (~1h of life) and look dead.
+	 */
+	/**
+	 * Read the live credential back into the pool, writing it to whichever slot the
+	 * credential actually belongs to.
+	 *
+	 * pi rotates tokens in place, so a stale pool copy would install a consumed
+	 * refresh token on a later return to that account — burning an account that was
+	 * perfectly healthy. This is why capture happens both before swapping away and
+	 * after installing.
+	 *
+	 * `entry` is the slot the CALLER BELIEVES owns this credential. Its identity is
+	 * consulted FIRST, because the caller is right in every ordinary case (pi can only
+	 * hand back what was installed), while the attribution search exists for the case
+	 * where it is NOT — a `/login` under a stale `active` slot. Preference, not
+	 * assumption: the caller's slot is used only when the credential's own identity
+	 * agrees it belongs there.
 	 *
 	 * IMPORTANT: capturing into memory is not enough on its own. pi refreshes a
 	 * credential in place, but when keyrouter later installs a DIFFERENT account it
@@ -478,14 +547,130 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		entry: KeyState | undefined,
 		persist = true,
 	): Promise<void> {
-		if (!storeApi || !entry) return;
+		if (!storeApi) return;
 		const live = await captureCredential(storeApi, rt.providerId);
 		if (!live) return;
+
+		// A configured `identityPath` that resolves nowhere is almost always a typo.
+		// Report it once, then let the built-in detection take over: a typo must not
+		// stop refreshes from being persisted.
+		if (rt.identityPath && !identityPathReported.has(rt.providerId)) {
+			const path = rt.identityPath;
+			const resolves =
+				resolveUserPath(live, path) !== undefined ||
+				rt.keys.some((k) => k.credential !== undefined && resolveUserPath(k.credential, path) !== undefined);
+			if (!resolves) {
+				identityPathReported.add(rt.providerId);
+				trace(`identityPath unresolved ${rt.providerId} "${path}"`);
+				warn(
+					uiCtx,
+					earlyWarnings,
+					`🔑 keyrouter: identityPath "${path}" does not resolve for ${rt.providerId}. ` +
+						"Falling back to automatic detection — check the field name and the claim path.",
+				);
+			}
+		}
+
+		// ── Which slot does this credential belong to? ───────────────────────────
+		//
+		// The order below is the fix for two separate failures:
+		//
+		//   1. The slot pi installed, when the credential's identity agrees it belongs
+		//      there. The ordinary case, and it must win.
+		//   2. Any slot the identity matches, for a credential pi holds that keyrouter
+		//      never installed.
+		//   3. The active pointer, only when provably the right slot.
+		//
+		// NOT trying step 1 first is what killed a healthy account. Every rotation
+		// captured the just-refreshed credential, an identity match sent it to a
+		// DIFFERENT slot, the source slot kept its expired token, the tripwire refused
+		// the foreign write, and nothing was persisted at all — so the account looked
+		// dead on the next lap and the pool looped forever. Preferring the installed
+		// slot records an ordinary refresh while still refusing to write one account's
+		// credential into another's.
+		const liveIdentity =
+			detectIdentity(live) ?? (rt.identityPath ? resolveUserPath(live, rt.identityPath) : undefined);
+		const entryIdentity = entry?.credential
+			? (detectIdentity(entry.credential) ??
+				(rt.identityPath ? resolveUserPath(entry.credential, rt.identityPath) : undefined))
+			: undefined;
+		let target: KeyState;
+		let via: string;
+
+		// 1. The slot pi installed, when the credential's identity agrees it belongs
+		//    there. Inlined rather than pre-computed as a boolean so the compiler can
+		//    see `entry` is defined on this branch.
+		if (
+			entry !== undefined &&
+			installedAccounts.has(rt.providerId) &&
+			(liveIdentity === undefined || entryIdentity === undefined || liveIdentity.value === entryIdentity.value)
+		) {
+			target = entry;
+			via = "installed";
+		} else {
+			// 2 and 3: a credential pi holds that keyrouter did not install. Find it
+			// by identity, and only then fall back to the active pointer.
+			const attribution = attributeCredential({
+				credential: live,
+				states: rt.keys,
+				activeName: rt.keys[rt.currentIndex]?.name,
+				expectedName: entry?.name,
+				installedByUs: installedAccounts.has(rt.providerId),
+				identityPath: rt.identityPath,
+			});
+			const picked =
+				attribution.kind === "match" || attribution.kind === "active-fallback"
+					? rt.keys[attribution.index]
+					: undefined;
+			if (!picked) {
+				const where =
+					attribution.kind === "ambiguous"
+						? `ambiguous: ${attribution.names.join(", ")} share ${attribution.via}=${attribution.value}`
+						: attribution.kind === "none"
+							? attribution.reason
+							: "no attributable slot";
+				// Ambiguity is surfaced because a write was actively declined to avoid
+				// hitting the wrong login. A plain non-match is ordinary bookkeeping —
+				// it happens on every capture before pi holds anything usable.
+				trace(`identity skip ${rt.providerId} (${where})`);
+				if (attribution.kind === "ambiguous") {
+					warn(
+						uiCtx,
+						earlyWarnings,
+						`🔑 keyrouter: not saving a refreshed ${rt.providerId} credential — ${where}. ` +
+							"Two pool accounts share that identity, so writing could overwrite the wrong one. " +
+							"Nothing was written; set \"identityPath\" for this provider to tell them apart.",
+					);
+				}
+				return;
+			}
+			target = picked;
+			via = attribution.kind === "match" ? attribution.via : "active-fallback";
+		}
+
+		// Last line of defence: never overwrite a slot holding a DIFFERENT account.
+		const tripwire = checkTripwire({ target, credential: live, identityPath: rt.identityPath });
+		if (!tripwire.ok) {
+			trace(`identity tripwire ${rt.providerId} (${tripwire.reason})`);
+			warn(
+				uiCtx,
+				earlyWarnings,
+				`🔑 keyrouter: refused to save a refreshed ${rt.providerId} credential — ${tripwire.reason}. ` +
+					"Overwriting would have replaced that account's login. Nothing was written. " +
+					"Run /keyrouter account ${rt.providerId} <name> to point the pool at what pi holds.",
+			);
+			return;
+		}
+
 		// Skip the write when nothing moved: most captures happen inside a single
 		// token lifetime, and a no-op must never touch the user's config file.
-		const changed = !entry.credential || !sameCredential(entry.credential, live);
-		entry.credential = live;
-		if (persist && changed) persistCredential(rt, entry.name, live);
+		const changed = !target.credential || !sameCredential(target.credential, live);
+		const moved = Boolean(entry) && entry !== target;
+		target.credential = live;
+		if (moved) {
+			trace(`identity ${rt.providerId}: credential belongs to ${target.name}, not ${entry?.name} (${via})`);
+		}
+		if (persist && changed) persistCredential(rt, target.name, live);
 	}
 
 	/**
@@ -545,12 +730,26 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Hand the provider back to whatever it had before this session started.
+	 * Leave the credential pi should carry into the next session.
 	 *
-	 * Only a credential that was actually present at session start is restored.
-	 * If there was none, leaving the active pool account installed is the
-	 * friendlier outcome: it is a valid login, and logging the user out would
-	 * turn a clean shutdown into a broken one.
+	 * WHAT THIS REPLACES: the session-start credential used to be reinstalled here.
+	 * That is only correct if pi's store still holds it — and it usually does not. pi
+	 * rotates the access token in place during the session, a `/login` may have
+	 * replaced the account entirely, and keyrouter has by now swapped the active
+	 * account several times. Reinstalling a credential captured hours ago therefore
+	 * put a STALE token back into `auth.json`, so the next session began by 403ing:
+	 * the account looked dead before a single request could succeed. Removing the
+	 * restore by itself would only invert the problem — leaving an account nobody
+	 * asked for — so what replaces it is the credential pi should actually resume
+	 * with: the pool's ACTIVE account, which is the account rotation last settled on
+	 * and the one the saved `active` field names.
+	 *
+	 * The expiry guard matters as much as the choice of account. A pool can hold a
+	 * login that is expired and whose refresh token is dead; installing one of those
+	 * at shutdown recreates the original failure exactly. Leaving pi's current
+	 * credential in place is strictly better — it is the one that was just working.
+	 * A stale access token is fine here, because pi refreshes it from the refresh
+	 * token, which Cline does not rotate.
 	 */
 	async function restoreSessionStartAccount(
 		providerId: string,
@@ -558,22 +757,184 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	): Promise<void> {
 		if (!storeApi) return;
 		const active = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
-		// Preserve pi's refreshed tokens for the account we are leaving.
+		// Capture pi's live credential into the pool FIRST. Installing anything below
+		// discards whatever pi holds now, and the pool's copy is what a later return to
+		// this account will install — so an uncaptured refresh would be lost for good.
 		await captureAccount(rt, active);
+		// And record a `/login` the pool has not seen. Same reason: the install below
+		// would otherwise overwrite a credential the user created by hand.
+		await captureDrift(rt);
 
-		const original = rt.sessionStartCredential;
-		if (!original) {
-			trace(`oauth restore ${providerId} (no session-start credential; leaving ${active?.name ?? "(none)"} installed)`);
+		// What pi holds right now is the freshest credential in existence for whichever
+		// account it belongs to, so that is what the handover reports and installs. An
+		// untouched snapshot of the ACTIVE account would be older by definition — pi
+		// refreshes in place and may have switched accounts entirely — and the previous
+		// implementation reinstalled the credential from SESSION START, which is how the
+		// next session ended up 403ing against a token three hours past its expiry.
+		const live = await captureCredential(storeApi, providerId);
+		const purpose = "handing to the next session";
+
+		// ── What is safe to leave installed? ────────────────────────────────────
+		//
+		// pi's current credential is the first choice, but it is only better than the
+		// pool's if it can still WORK. When the whole pool is dead and pi's refresh
+		// failed, pi's credential is an expired access token backed by a revoked refresh
+		// token — and leaving that installed is precisely the "next session 403s before
+		// it can do anything" failure this function exists to prevent. So it is tested
+		// the same way the pool's copy is, and the pool's copy is the fallback rather
+		// than being skipped.
+		const viable = (credential: KeyState["credential"]): credential is NonNullable<KeyState["credential"]> =>
+			credential !== undefined && credential.expires > Date.now();
+
+		let chosen = live;
+		let choice = live ? `pi's credential${identityLabel(live) ? ` for ${identityLabel(live)}` : ""}` : "";
+		if (!viable(chosen) && viable(active?.credential)) {
+			chosen = active.credential;
+			choice = `active pool account ${active.name}`;
+		}
+
+		if (!viable(chosen)) {
+			// Nothing can be handed over safely, so pi's store is left exactly as it is.
+			// Rewriting it with a credential that cannot work would only look like a
+			// successful handover while guaranteeing the next session starts broken.
+			trace(
+				`oauth keep ${providerId} (nothing viable for ${purpose}; ` +
+					`pi's credential ${live ? "is expired" : "is absent"} and no pool account can replace it — leaving pi's store untouched)`
+			);
+			installedAccounts.delete(providerId);
+			rt.injecting = false;
 			return;
 		}
-		const result = await installCredential(storeApi, providerId, original);
+
+		const remaining = chosen.expires - Date.now();
+		const result = await installCredential(storeApi, providerId, chosen);
 		if (result.ok) {
-			trace(`oauth restore ${providerId} -> session-start credential`);
+			trace(`oauth keep ${providerId} (${choice}, expires in ${Math.round(remaining / 60_000)}m)`);
 		} else {
-			trace(`oauth restore failed ${providerId} (${result.error})`);
+			trace(`oauth keep failed ${providerId} (${result.error})`);
 		}
 		installedAccounts.delete(providerId);
 		rt.injecting = false;
+	}
+
+	/**
+	 * Which of two credentials for the SAME account is the newer one.
+	 *
+	 * `expires` is the arbiter, because it is the only field that orders two
+	 * credentials. Both secrets rotate, so neither can be compared for age: a
+	 * different refresh token means a different LOGIN, not necessarily a newer one,
+	 * and a different access token merely means one side refreshed.
+	 *
+	 * That distinction is what keeps a hand-edited config safe. "pi is always
+	 * fresher" is nearly true and still wrong in both directions:
+	 *
+	 *   live.expires > stored.expires   pi is newer — a `/login`, or a refresh that
+	 *                                   happened while keyrouter was not watching
+	 *   stored.expires > live.expires   the POOL is newer — the user pasted fresh
+	 *                                   credentials into keyrouter.json by hand, and
+	 *                                   replacing them with pi's older copy would
+	 *                                   destroy the only good credential there is
+	 *   equal, different refresh        same age, different login: take pi's, since
+	 *                                   pi's is the one actually in use
+	 */
+	function isNewer(incoming: KeyState["credential"], incumbent: KeyState["credential"]): boolean {
+		if (!incoming) return false;
+		if (!incumbent) return true;
+		const a = typeof incoming.expires === "number" ? incoming.expires : 0;
+		const b = typeof incumbent.expires === "number" ? incumbent.expires : 0;
+		if (a !== b) return a > b;
+		return incoming.refresh !== incumbent.refresh;
+	}
+
+	/**
+	 * Notice that pi's stored credential is not the pool's copy for that account, and
+	 * record pi's version.
+	 *
+	 * WHY THIS EXISTS: pi exposes no login, logout or credential-changed event, so a
+	 * `/login` is invisible to an extension until something looks. Without this the
+	 * pool keeps a stale copy and then does the worst possible thing with it — the
+	 * next rotation installs that stale copy OVER the freshly logged-in one, because
+	 * the pool's copy is what gets written to pi's store. The account then fails with
+	 * invalid_grant despite having just been authenticated by hand.
+	 *
+	 * Only fires when the account's identity can be established. `captureAccount`
+	 * refuses to guess where a credential belongs, and a `/login` produces exactly
+	 * that situation — a credential keyrouter did not install — so a provider whose
+	 * identity cannot be read cannot be tracked this way. Refusing is deliberate: the
+	 * alternative is stamping it onto whichever slot looks active, which is what
+	 * aliased two accounts in the first place.
+	 */
+	async function captureDrift(rt: ProviderRuntime): Promise<void> {
+		if (!storeApi || rt.kind !== "oauth" || !installedAccounts.has(rt.providerId)) return;
+		const live = await captureCredential(storeApi, rt.providerId);
+		if (!live) return;
+		const identity =
+			detectIdentity(live) ?? (rt.identityPath ? resolveUserPath(live, rt.identityPath) : undefined);
+		if (!identity) {
+			// Not an error: nothing can be attributed, so nothing is touched.
+			trace(`drift skip ${rt.providerId} (credential carries no readable identity)`);
+			return;
+		}
+		const slot = rt.keys.find((k) => {
+			if (!k.credential) return false;
+			const other =
+				detectIdentity(k.credential) ?? (rt.identityPath ? resolveUserPath(k.credential, rt.identityPath) : undefined);
+			return other?.value === identity.value;
+		});
+		if (!slot) {
+			// pi holds a login no pool slot represents. Capturing is the wrong response —
+			// adding accounts is the user's decision — so say so once and leave the file
+			// alone. Worth saying because the pool WILL overwrite this on the next
+			// rotation, which is a silent loss otherwise.
+			trace(`drift unknown ${rt.providerId} (pi holds ${identity.value}, no pool slot has it)`);
+			warn(
+				uiCtx,
+				earlyWarnings,
+				`🔑 keyrouter: pi is signed in as ${identity.value} for ${rt.providerId}, but no pool account has that identity. ` +
+					"The pool will overwrite it on the next rotation. Add it as an account, or /login as a pooled one.",
+			);
+			return;
+		}
+		// Take pi's copy only when it is genuinely newer. `expires` decides that (see
+		// `isNewer`), so a credential pasted into keyrouter.json by hand is left
+		// alone rather than replaced by pi's older one.
+		if (!isNewer(live, slot.credential)) return;
+		// The tripwire still applies: an identity resolving to a slot whose stored
+		// credential names a DIFFERENT account is refused rather than overwritten.
+		const tripwire = checkTripwire({ target: slot, credential: live, identityPath: rt.identityPath });
+		if (!tripwire.ok) {
+			trace(`drift refused ${rt.providerId} (${tripwire.reason})`);
+			return;
+		}
+		trace(`drift ${rt.providerId}: pi holds a newer credential for ${slot.name} (via ${identity.via})`);
+		slot.credential = live;
+		persistCredential(rt, slot.name, live);
+	}
+
+	/**
+	 * Reconcile every OAuth pool against pi's store.
+	 *
+	 * Called BEFORE anything is installed, which is the only moment it can work. On
+	 * `session_start` the bootstrap installs a pool credential over whatever pi had,
+	 * so a check running afterwards finds keyrouter's own copy and has nothing to
+	 * notice. What it is there to catch:
+	 *
+	 *   - a `/login` from a session that was force-killed, where no shutdown ran
+	 *   - any credential change made outside a session, including pi's own rotation
+	 *
+	 * A no-op unless pi's credential is genuinely newer for the SAME account, so it
+	 * neither churns the config nor overrides a hand-edited pool.
+	 */
+	async function reconcileCredentials(): Promise<void> {
+		if (!storeApi) return;
+		for (const rt of runtimes.values()) {
+			if (rt.kind !== "oauth") continue;
+			try {
+				await captureDrift(rt);
+			} catch (error) {
+				trace(`drift error ${rt.providerId} (${error instanceof Error ? error.message : String(error)})`);
+			}
+		}
 	}
 
 	/**
@@ -587,6 +948,11 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		}
 		if (config.providers.length === 0) return;
 		uiCtx = ctx.ui;
+		// Flush anything raised while there was no UI to notify. An OAuth bootstrap
+		// installs (and therefore captures) before this assignment, so a refusal there
+		// would otherwise be lost entirely — the user would never learn that a refreshed
+		// credential was declined. Delivered oldest-first so the earliest warning, usually
+		// the one naming the cause, is seen first.
 
 		// Report config warnings once (dropped accounts, mutually exclusive fields).
 		if (!warningsReported && config.warnings && config.warnings.length > 0) {
@@ -594,6 +960,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			for (const w of config.warnings) trace(`config warning ${w}`);
 			ctx.ui.notify(`🔑 keyrouter: config\n  ${config.warnings.join("\n  ")}`, "warning");
 		}
+		for (const message of earlyWarnings.splice(0)) ctx.ui.notify(message, "warning");
 
 		// Capability probes. Each pool kind degrades independently: a build without
 		// the credential store must still rotate API keys, and vice versa.
@@ -634,12 +1001,6 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			if (!key) continue;
 
 			if (p.kind === "oauth") {
-				// Remember what the provider had before us, so a clean shutdown can put
-				// it back. Read-only, best effort — a read failure just means we treat
-				// it as "no stored credential".
-				rt.sessionStartCredential = storeApi
-					? await captureCredential(storeApi, providerId)
-					: undefined;
 				setActive(rt, idx);
 				recordUse(key);
 				if (await applyAccount(providerId, key, ctx)) {
@@ -676,6 +1037,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Reconcile BEFORE the bootstrap installs anything. The install replaces
+		// whatever pi holds, so a `/login` left behind by a force-killed session — one
+		// where no shutdown handler ever ran — would be destroyed before anything could
+		// notice it. This is the only moment in the session when pi's credential is
+		// still observable on its own.
+		await activate(ctx);
+		await reconcileCredentials();
 		await activate(ctx);
 	});
 
@@ -684,6 +1052,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	// activate() is idempotent — only bootstraps once per provider.
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await activate(ctx);
+		// Then reconcile the pool against pi's store. This is the only place a `/login`
+		// can be noticed at all: pi exposes no login, logout or credential-changed
+		// event, so the change is observable only by looking. Doing it here rather than
+		// inside `activate` matters — `activate` short-circuits for every already-
+		// bootstrapped provider, and `/login` is exactly the case that got skipped.
+		await reconcileCredentials();
 	});
 
 	// Success clears a key's cooldown without touching rotation position, so a

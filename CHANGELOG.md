@@ -18,9 +18,72 @@ from the repository history directly.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] — 2026-10-15
 
-Nothing yet.
+### Fixed
+
+- **A refreshed credential is no longer written into the wrong pool account.** This was a data-loss
+  bug, and it destroyed two of five accounts in the reporter's own pool.
+
+  pi stores exactly one credential per provider, so `auth.json` can hold a credential keyrouter did
+  not install — logging in as account A while the saved `active` field still names slot B is enough.
+  The write-back then assumed the credential belonged to the slot the caller believed was active and
+  stamped A's tokens into B. B was aliased onto A, B's own refresh token was orphaned, and B failed
+  with `invalid_grant` on its next use even though nothing had been wrong with it. Since a refresh
+  token cannot be recovered once dropped, the loss was permanent.
+
+  Attribution is now a **search** rather than an assumption, and the caller's belief is no longer
+  trusted. Signals are tried strongest-first: the new `identityPath` setting, then an identity claim
+  decoded from a token field, then a known credential field, then exact refresh-token equality, and
+  only last the `active` pointer — and that last one solely when keyrouter itself installed the
+  credential currently in pi.
+
+  Two safeguards back it up. An **ambiguous** match (two slots sharing the identity) writes nothing. A
+  **mismatched** target slot — already holding a different account — is refused outright, because the
+  credential stored there holds the refresh token that cannot be recovered. Both are surfaced as a
+  warning and recorded in the trace sink instead of failing silently.
+- **A refreshed credential is no longer discarded in favour of another account.** The alias fix above
+  introduced a second, opposite failure: a credential is only `IN-SYNC` when its slot identity
+  equals the **active** slot's, but attribution matched whichever slot shared the identity. When pi
+  refreshed the active account, the identity match still resolved to that same slot, so the two
+  agreed — yet the caller was handed a *different* slot, the source slot kept its expired token, the
+  tripwire then correctly refused the foreign write, and **nothing was persisted at all**.
+
+  The result was that a healthy account appeared dead on the next lap: pi refreshed it successfully,
+  the refreshed token was never recorded, and the next rotation presented the expired one again. That
+  made the 403 self-sustaining, and the pool looped until it was exhausted.
+
+  The installed slot is now preferred **when the credential's own identity agrees it belongs there** —
+  preference rather than the assumption that caused the original corruption. An ordinary refresh is
+  recorded in place; a genuine identity mismatch is still refused.
+
+### Fixed
+
+- **Identity warnings raised during bootstrap were silently discarded.** An OAuth pool bootstraps
+  inside `before_agent_start`, which runs *before* `ui.notify` is usable — `uiCtx` is assigned later in
+  the same function. Every refusal introduced above therefore reached the user as a silent no-op. They
+  are now buffered and flushed once the UI exists, oldest first, and a repeated message is collapsed
+  rather than re-queued.
+
+### Added
+
+- **`identityPath`** — an optional per-provider setting naming where a provider's account identity
+  lives, for providers whose credentials the automatic detection cannot identify. Format is
+  `level1:level2`: `level1` is a key of the credential object and `level2` is a path into that value
+  after decoding it (`"refresh"`, `"access:email"`, `"access:user.email"`, `"accountId"`,
+  `"accountId:sub"`). Decoding is automatic — JWT, JSON, or a base64-wrapped payload — and a plain
+  string that merely happens to be base64-decodable is deliberately left alone, so an opaque token
+  cannot be misread as JSON and reported as an identity. A path that resolves nowhere warns once and
+  falls back to detection, so a typo cannot stop refreshes from being persisted.
+- `test/unit-identity.mjs`, 75 cases: codec detection, path resolution, signal ordering, ambiguity
+  and tripwire refusal, and a replay of the incident's own account values. The attribution and
+  tripwire assertions in the regression block all fail against the previous implementation.
+
+### Changed
+
+- The attribution decision and any refusal are reported through the existing `PI_KEYROUTER_TRACE`
+  sink (`identity ...`, `identity skip ...`, `identity tripwire ...`), so a credential that stopped
+  persisting can be diagnosed from the trace alone.
 
 ## [1.3.3] — 2026-10-09
 
@@ -384,6 +447,7 @@ The last release of the original line, and the version this fork started from.
   and surfacing the real error once all keys are exhausted.
 
 [Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...HEAD
+[1.4.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.0...v1.3.1

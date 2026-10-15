@@ -24,7 +24,15 @@ export const ACCESS_3 = "oauth:access-3";
 
 const FAR_FUTURE = () => Date.now() + 24 * 60 * 60 * 1000;
 
-/** One account entry as keyrouter's config sees it. */
+/**
+ * One account entry as keyrouter's config sees it.
+ *
+ * `accountId` doubles as the account's identity: keyrouter reads it through
+ * `detectIdentity`, so tests exercise the same identity path a real provider's
+ * claims would drive. The fixture's `access` values are opaque on purpose, so
+ * without this every capture would report "no readable identity" and the
+ * attribution logic would never be reached.
+ */
 const account = (name, access, extra = {}) => ({
 	name,
 	credential: {
@@ -32,6 +40,7 @@ const account = (name, access, extra = {}) => ({
 		access,
 		refresh: `refresh-${access}`,
 		expires: FAR_FUTURE(),
+		accountId: name,
 		...extra,
 	},
 });
@@ -54,6 +63,9 @@ export const OAUTH_ACCOUNTS_EXPIRING_FIRST = [
 			refresh: "refresh-1",
 			// Inside pi's ~5 minute validity window, so pi refreshes on first use.
 			expires: Date.now() + 60_000,
+			// Identity, for the same reason `account()` carries one: keyrouter reads it
+			// to attribute a captured credential to a slot.
+			accountId: "a1",
 		},
 	},
 	account("a2", "access-2"),
@@ -68,9 +80,57 @@ export const OAUTH_ACCOUNTS_DEAD_FIRST = [
 			access: "access-dead",
 			refresh: "refresh-dead",
 			expires: Date.now() + 30_000,
+			accountId: "a1",
 		},
 	},
 	account("a2", "access-2"),
+];
+
+/**
+ * The MIRROR of the above: here the dead account is LAST.
+ *
+ * The shutdown handover must not install a dead credential, and it can only be
+ * asked not to when the pool's ACTIVE account is the dead one. With the dead entry
+ * first, a rotation walks away from it and the active account ends up healthy, so
+ * that guard is never reached. Reaching it requires the dead account to be the one
+ * rotation settles on.
+ */
+export const OAUTH_ACCOUNTS_DEAD_SECOND = [
+	account("a1", "access-1"),
+	{
+		name: "a2",
+		credential: {
+			type: "oauth",
+			access: "access-dead",
+			refresh: "refresh-dead",
+			expires: Date.now() + 30_000,
+			accountId: "a2",
+		},
+	},
+];
+
+/**
+ * A pool whose ONLY account is dead, with an already-expired access token.
+ *
+ * This is the case the shutdown guard exists for. keyrouter installs the account at
+ * session start, pi fails to refresh it, and rotation has nowhere to go (one entry),
+ * so the active account stays dead. Handing that to the next session guarantees it
+ * starts by failing, which is exactly the live symptom.
+ */
+export const OAUTH_ACCOUNTS_DEAD_ONLY = [
+	{
+		name: "a1",
+		credential: {
+			type: "oauth",
+			access: "access-dead",
+			refresh: "refresh-dead",
+			// Already in the PAST, unlike `accounts-dead-first`'s +30s (which exists to make
+			// pi refresh on first use). This case needs a credential that CANNOT work, so
+			// `expires` must have passed rather than merely be close.
+			expires: Date.now() - 60_000,
+			accountId: "a1",
+		},
+	},
 ];
 
 /** Two healthy accounts. */
@@ -388,4 +448,122 @@ export const oauthCases = [
 				["nothing was persisted", !traceHas(trace, "persist kroauth")],
 			],
 		},
-	];
+	// -------------------------------------------------------------------------
+	{
+		// REGRESSION: a `/login` must reach the pool.
+		//
+		// pi exposes no login, logout or credential-changed event, so a credential the
+		// user creates by hand is only observable by looking. This reaches that state
+		// through the fixture's refresh hook, which stamps an identity belonging to a
+		// DIFFERENT pool account — exactly what `/login` as another account produces.
+		//
+		// Without the drift check the pool kept its old copy and then installed it OVER
+		// the new login on the next rotation, so the account failed with invalid_grant
+		// despite having just been authenticated. Observed live: five `/login`s and not
+		// one trace line, with the new refresh token absent from keyrouter.json.
+		name: "oauth-login-drift-is-recorded",
+		config: "accounts-expiring-first",
+		oauth: true,
+		auth: authJson(),
+		// a1 is the account keyrouter installs, and its near-expiry credential makes pi
+		// refresh on first use. The hook then stamps a2's identity onto the result, so pi
+		// ends up holding a credential for an account OTHER than the one installed —
+		// which is the state a `/login` as another account produces.
+		drift: "a2",
+		plan: { default: "ok", text: "PONG", repeatLast: true },
+		expect: ({ keys, trace, pi, configAfter, oauthLog }) => {
+			const accounts = configAfter?.providers?.[0]?.accounts ?? [];
+			const a1 = accounts.find((a) => a.name === "a1")?.credential;
+			const a2 = accounts.find((a) => a.name === "a2")?.credential;
+			return [
+				["pi recovered", /PONG/.test(pi.stdout)],
+				["pi refreshed, which is what produces the foreign credential", (oauthLog ?? []).length > 0],
+				["the drift was attributed to a2, not the installed a1", traceHas(trace, "credential belongs to a2, not a1")],
+				["attribution used the credential's own identity", traceHas(trace, "(accountId)")],
+				["the credential was persisted to a2's slot", typeof a2?.access === "string" && a2.access.startsWith("refreshed-")],
+				["a2's refresh token moved to the new one", typeof a2?.refresh === "string" && a2.refresh.startsWith("refresh-")],
+				["a1's own slot was NOT overwritten with someone else's credential", a1?.accountId === "a1"],
+				["the tripwire did not have to refuse anything", !traceHas(trace, "identity tripwire kroauth")],
+				["a request still carried a working OAuth bearer", keys.some((k) => typeof k === "string" && k.startsWith("oauth:"))],
+			];
+		},
+	},
+	// -------------------------------------------------------------------------
+	{
+		// A drift that resolves to NO pool slot must be reported, never written.
+		//
+		// pi holding a login the pool does not contain is normal — the user signed into
+		// an account they never added — and adding it is their decision, not keyrouter's.
+		// The pool WILL overwrite it on the next rotation, so staying quiet would lose a
+		// working login without a word.
+		name: "oauth-login-drift-into-unknown-account-is-reported",
+		config: "accounts-expiring-first",
+		oauth: true,
+		auth: authJson(),
+		drift: "not-a-pool-account",
+		plan: { default: "ok", text: "PONG", repeatLast: true },
+		expect: ({ pi, trace, configAfter }) => {
+			const accounts = configAfter?.providers?.[0]?.accounts ?? [];
+			return [
+				["pi recovered", /PONG/.test(pi.stdout)],
+				["the unknown identity was traced", traceHas(trace, "drift unknown kroauth")],
+				["nothing was written into any slot", accounts.every((a) => a.credential.accountId === a.name)],
+				["no account was invented", accounts.length === 2],
+			];
+		},
+	},
+	// -------------------------------------------------------------------------
+	{
+		// REGRESSION: shutdown must hand over a credential that can actually work.
+		//
+		// The session-start credential used to be reinstalled here. It is stale by then
+		// — pi rotated the access token in place, and keyrouter swapped accounts several
+		// times — so the next session began by 403ing against an expired token. The live
+		// case exited holding a credential whose `expires` was three hours in the past.
+		name: "oauth-shutdown-hands-over-the-active-account",
+		config: "accounts",
+		oauth: true,
+		auth: authJson(),
+		plan: { default: "ok", text: "PONG", repeatLast: true },
+		expect: ({ trace, authAfter }) => {
+			// pi's own store already holds a credential keyrouter installed, so the handover
+			// should keep it rather than swap in a snapshot. What matters is that the
+			// credential left behind is one that can actually work.
+			return [
+				["shutdown recorded what it handed over", /oauth keep kroauth/.test(trace.join("\n"))],
+				["the handover names which credential was kept", /oauth keep kroauth \(.+expires in \d+m\)/.test(trace.join("\n"))],
+				["and it reports pi's credential, not an old snapshot", traceHas(trace, "pi's credential for a1")],
+				["pi's store still holds an OAuth credential", authAfter?.kroauth?.type === "oauth"],
+				["the handed-over credential is the one pi held", authAfter?.kroauth?.accountId === "a1"],
+				["and it is not expired", typeof authAfter?.kroauth?.expires === "number" && authAfter.kroauth.expires > Date.now()],
+				["the unrelated provider entry survived", authAfter?.["unrelated-provider"]?.key === "sk-must-survive"],
+			];
+		},
+	},
+	// -------------------------------------------------------------------------
+	{
+		// A pool whose active account is EXPIRED must not be installed at shutdown.
+		//
+		// This is the exact live failure: the expired session-start credential was put
+		// back, so the next session 403ed before a single request could succeed. Leaving
+		// pi's current credential — the one that was just working — is strictly better.
+		name: "oauth-shutdown-does-not-install-an-expired-account",
+		config: "accounts-dead-only",
+		oauth: true,
+		auth: authJson(),
+		plan: { default: "ok", text: "PONG", repeatLast: true },
+		expect: ({ trace, authAfter, configAfter }) => {
+			// The pool has one account and it cannot work, so there is nothing safe to
+			// hand over. The store must be left alone rather than rewritten with a dead
+			// credential, which would look like a successful handover while guaranteeing
+			// the next session starts broken.
+			const a1 = configAfter?.providers?.[0]?.accounts?.[0]?.credential;
+			return [
+				["shutdown refused to hand over anything", traceHas(trace, "nothing viable for handing to the next session")],
+				["and said why: pi's credential is expired", traceHas(trace, "pi's credential is expired")],
+				["the pool's account was recorded as expired too", typeof a1?.expires === "number"],
+				["pi's store was left untouched rather than given a dead credential", authAfter?.kroauth?.access === "access-dead"],
+			];
+		},
+	},
+];
