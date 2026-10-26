@@ -23,7 +23,8 @@
 //   ],
 //   "maxRetries": 3,
 //   "cooldownMs": 60000,
-//   "overloadedCooldownMs": 30000
+//   "overloadedCooldownMs": 30000,
+//   "notifications": "all"  // "all" | "quiet" | "silent" — status-line volume
 // }
 //
 // Schema — OAuth account pool (mutually exclusive with `keys`):
@@ -57,6 +58,15 @@
 // `name` is the provider id pi uses — built-in (`google`, `anthropic`), a
 // `models.json` id, or another extension's id. `match` is accepted and ignored
 // for backward compatibility.
+//
+// `notifications` tones the status lines down without losing events that matter:
+//   all     (default) every event notifies
+//   quiet   routine rate-limited rotations and overload notices go silent;
+//           rotations that need the user to act (unauthorized key, account
+//           quota, dead refresh token) still notify
+//   silent  all rotation and overload notices go silent
+// Pool exhaustion notifies in every mode — it is the one event where the
+// request actually fails. An unknown value warns and falls back to "all".
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -65,6 +75,7 @@ import type {
 	AccountEntry,
 	ApiKey,
 	KeyRouterConfig,
+	NotificationLevel,
 	OAuthCredential,
 	PoolKind,
 	ProviderConfig as ProviderPool,
@@ -358,6 +369,7 @@ export function defaultConfig(): KeyRouterConfig {
 		maxRetries: 3,
 		cooldownMs: 60_000,
 		overloadedCooldownMs: 30_000,
+		notifications: "all" satisfies NotificationLevel,
 	};
 }
 
@@ -497,12 +509,30 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 		}
 	}
 
+	// Status-line volume. Unknown values warn rather than break: a typo must
+	// not silently stop the user's rotation notices from appearing.
+	let notifications: NotificationLevel = "all";
+	if (input.notifications !== undefined) {
+		if (
+			input.notifications === "all" ||
+			input.notifications === "quiet" ||
+			input.notifications === "silent"
+		) {
+			notifications = input.notifications;
+		} else {
+			warnings.push(
+				`"notifications": ${JSON.stringify(input.notifications)} is not one of "all", "quiet", "silent" — using "all".`,
+			);
+		}
+	}
+
 	return {
 		providers,
 		maxRetries: typeof input.maxRetries === "number" ? input.maxRetries : 3,
 		cooldownMs: typeof input.cooldownMs === "number" ? input.cooldownMs : 60_000,
 		overloadedCooldownMs:
 			typeof input.overloadedCooldownMs === "number" ? input.overloadedCooldownMs : 30_000,
+		notifications,
 		warnings,
 	};
 }

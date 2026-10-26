@@ -1,0 +1,10 @@
+{
+  "worktree": {
+    "setup": "bun install"
+  },
+  "scripts": {
+    "typecheck": {
+      "command": "bun run typecheck"
+    }
+  }
+}

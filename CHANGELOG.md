@@ -18,6 +18,19 @@ from the repository history directly.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`"notifications"` config setting — `"all"` (default), `"quiet"`, or `"silent"` — tones down the
+  status lines without losing the events that matter.** `quiet` silences the routine ones —
+  rate-limited rotations (e.g. `🔑 keyrouter: nvidia jsjery123 → jery99961 (HTTP 429, rate-limited)`)
+  and provider-overload notices — but keeps rotations that need you to act: an unauthorized key, an
+  account out of quota, a dead refresh token. `silent` drops those too. Pool exhaustion is never
+  silenced — it still notifies in every mode, because it is the one event where the request actually
+  fails. `/keyrouter status` shows the active level, and the trace sink records every decision
+  regardless of level.
+
 ## [1.4.0] — 2026-10-15
 
 ### Fixed

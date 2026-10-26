@@ -88,6 +88,21 @@ export interface ProviderConfig {
 	identityPath?: string;
 }
 
+/**
+ * How much keyrouter prints while it works. Gated events still happen —
+ * only their status lines change; the trace sink records every decision
+ * regardless of level.
+ *
+ *   all    — every event notifies (the default, and the historical behaviour)
+ *   quiet  — routine events (rate-limited rotations, provider overloads) go
+ *            silent; events that need the user to act still notify
+ *   silent — all rotation and overload notices go silent
+ *
+ * Pool exhaustion is deliberately not coverable by this setting: it is the one
+ * event where the user's request actually fails, so it notifies at every level.
+ */
+export type NotificationLevel = "all" | "quiet" | "silent";
+
 /** Top-level config. */
 export interface KeyRouterConfig {
 	providers: ProviderConfig[];
@@ -99,6 +114,12 @@ export interface KeyRouterConfig {
 	 *  error (ms). Provider-wide — all keys of this provider share the
 	 *  same deadline. Not counted as a key failure. Default 30_000. */
 	overloadedCooldownMs: number;
+	/**
+	 * Which events earn a visible status line. Default "all". See
+	 * `NotificationLevel` for what each level keeps. Pool exhaustion is never
+	 * silenced, so the one event that kills a request always shows.
+	 */
+	notifications?: NotificationLevel;
 	/** Human-readable notes from loading (dropped accounts, ignored fields).
 	 *  Not read from disk; produced by `normalize` and reported once. */
 	warnings?: string[];

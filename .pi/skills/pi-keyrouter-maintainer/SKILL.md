@@ -126,7 +126,7 @@ Two failure modes dominate this procedure; both are covered in detail in
 
 ```powershell
 npm run typecheck          # bun x tsc --noEmit -p tsconfig.json
-npm test                   # selftest + unit + 32 e2e cases
+npm test                   # selftest + unit + 37 e2e cases
 npm run test:unit          # fast; no pi, no network, no credentials
 ```
 

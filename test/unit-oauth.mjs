@@ -22,6 +22,13 @@ const { credentialStore, isOAuthCredential, installCredential, captureCredential
 const { parseAccountCredential, validateCredential, loadConfig, expandEnv, configPath, writeBackActive } =
 	await import("../config.ts");
 const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = await import("../rotation.ts");
+const {
+	notifyRotation,
+	notifyOverloaded,
+	notifyExhausted,
+	rotationIsNotifiable,
+	overloadIsNotifiable,
+} = await import("../notification.ts");
 // Importing index.ts binds no pi APIs at module scope (the extension only
 // registers handlers inside its default export), so the pure command parser is
 // reachable from a plain Node process.
@@ -277,6 +284,60 @@ try {
 	// An OAuth pool with no usable accounts is dropped entirely.
 	writeFileSync(cfgFile, JSON.stringify({ providers: [{ name: "cline", accounts: [] }] }), "utf8");
 	check("an OAuth pool with no accounts is dropped", loadConfig().providers.length === 0);
+
+	// notifications — which events earn a visible status line. The policy
+	// functions are pure; the notify wrappers are exercised with a fake UI so
+	// the gating itself is pinned, not just the decision helpers.
+	const writeCfg = (value) =>
+		writeFileSync(
+			cfgFile,
+			JSON.stringify({ providers: [{ name: "google", keys: [{ name: "primary", value: "sk-1" }] }], notifications: value }),
+			"utf8",
+		);
+	writeCfg("quiet");
+	check("notifications: quiet is read back", loadConfig().notifications === "quiet");
+	writeCfg("silent");
+	check("notifications: silent is read back", loadConfig().notifications === "silent");
+	writeCfg("loud");
+	const badLevel = loadConfig();
+	check("an unknown notifications value falls back to all", badLevel.notifications === "all");
+	check(
+		"an unknown notifications value warns (and never breaks the pool)",
+		badLevel.providers.length === 1 && (badLevel.warnings ?? []).some((w) => /"notifications"/.test(w)),
+		JSON.stringify(badLevel.warnings),
+	);
+	writeCfg(undefined);
+	check("notifications defaults to all when absent", loadConfig().notifications === "all");
+
+	const notified = [];
+	const fakeUi = { notify: (message, kind) => notified.push([message, kind]) };
+	const rotation = (reason) => ({ provider: "google", fromKey: "A", toKey: "B", reason, status: 429, attempt: 1 });
+	check("rotationIsNotifiable: all shows rate-limited", rotationIsNotifiable("all", "rate-limited"));
+	check("rotationIsNotifiable: quiet hides rate-limited", !rotationIsNotifiable("quiet", "rate-limited"));
+	check("rotationIsNotifiable: quiet keeps unauthorized", rotationIsNotifiable("quiet", "unauthorized"));
+	check("rotationIsNotifiable: quiet keeps quota", rotationIsNotifiable("quiet", "quota"));
+	check("rotationIsNotifiable: quiet keeps refresh-failed", rotationIsNotifiable("quiet", "refresh-failed"));
+	check("rotationIsNotifiable: silent hides unauthorized too", !rotationIsNotifiable("silent", "unauthorized"));
+	check("rotationIsNotifiable: an absent level means all", rotationIsNotifiable(undefined, "rate-limited"));
+	check("overloadIsNotifiable: only the all level shows it", overloadIsNotifiable("all") && !overloadIsNotifiable("quiet") && !overloadIsNotifiable("silent"));
+	check("overloadIsNotifiable: an absent level means all", overloadIsNotifiable(undefined));
+	notified.length = 0;
+	notifyRotation(fakeUi, rotation("rate-limited"), "quiet");
+	check("notifyRotation is silent for a quiet rate-limited rotation", notified.length === 0);
+	notifyRotation(fakeUi, rotation("unauthorized"), "quiet");
+	check(
+		"notifyRotation still notifies for unauthorized in quiet",
+		notified.length === 1 && notified[0][1] === "warning" && /unauthorized/.test(notified[0][0]),
+	);
+	notifyRotation(fakeUi, rotation("unauthorized"), "silent");
+	check("notifyRotation is silent in silent mode", notified.length === 1);
+	notifyOverloaded(fakeUi, "google", 30_000, "quiet");
+	check("notifyOverloaded is silent in quiet", notified.length === 1);
+	notifyExhausted(fakeUi, "google", ["A", "B"], "keys");
+	check(
+		"notifyExhausted always notifies — no level can gate it",
+		notified.length === 2 && notified[1][1] === "error" && /exhausted/.test(notified[1][0]),
+	);
 } finally {
 	rmSync(dir, { recursive: true, force: true });
 	delete process.env.PI_KEYROUTER_CONFIG;

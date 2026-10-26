@@ -191,6 +191,9 @@ const ACCOUNTS = (accounts, extra = {}) => ({
 
 const CONFIGS = {
 	abc: POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]),
+	// Same pool with the status lines turned down: the setting must gate only
+	// ui.notify, never the rotation machinery itself.
+	"abc-quiet": { ...POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]), notifications: "quiet" },
 	// Same pool, but explicitly allowed to shadow a stored OAuth login.
 	"abc-takeover": {
 		...POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]),
@@ -455,6 +458,26 @@ const cases = [
 			["trace: B marked ok", traceHas(trace, "success krtest key=B")],
 			// 429 is in pi's retryable set, so its own retry used sk-b and the
 			// settle-time continuation must not have been needed.
+			["no settle continuation for a pi-retryable error", !traceHas(trace, "continue ")],
+		],
+	},
+	{
+		name: "quiet-notifications-still-rotate",
+		config: "abc-quiet",
+		// `notifications` gates only the ui.notify status lines, and those are
+		// invisible in print mode anyway — so the proof here is that the pool
+		// machinery is untouched: same walk, same trace, same recovery as
+		// rotate-on-429. (The gating itself is pinned in unit-oauth.mjs, where a
+		// fake UI can observe the notify calls.)
+		plan: { byKey: { "sk-a": 429 }, default: "ok", text: "PONG" },
+		expect: ({ keys, trace, pi }) => [
+			["pi recovered and printed PONG", /PONG/.test(pi.stdout)],
+			["first request used sk-a", keys[0] === "sk-a"],
+			["a later request used sk-b", keys.includes("sk-b")],
+			["trace: rotate A -> B (rotation untouched)", traceHas(trace, "rotate krtest A -> B")],
+			["trace: 429 rate-limited", traceHas(trace, "429 rate-limited")],
+			["trace: no exhaustion", !traceHas(trace, "exhausted")],
+			["trace: B marked ok", traceHas(trace, "success krtest key=B")],
 			["no settle continuation for a pi-retryable error", !traceHas(trace, "continue ")],
 		],
 	},

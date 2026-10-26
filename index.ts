@@ -1108,7 +1108,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			const now = Date.now();
 			for (const k of rt.keys) markOverloaded(k, config.overloadedCooldownMs, now);
 			trace(`overload ${providerId} (provider-wide ${config.overloadedCooldownMs}ms, no rotation)`);
-			if (uiCtx) notifyOverloaded(uiCtx, providerId, config.overloadedCooldownMs);
+			if (uiCtx) notifyOverloaded(uiCtx, providerId, config.overloadedCooldownMs, config.notifications);
 			return;
 		}
 
@@ -1209,7 +1209,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				status,
 				attempt: rt.keys.reduce((a, k) => a + k.failures, 0),
 			};
-			notifyRotation(uiCtx, rotation);
+			notifyRotation(uiCtx, rotation, config.notifications);
 		}
 	});
 
@@ -1307,7 +1307,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						"warning",
 					);
 				}
-				const lines: string[] = [`🔑 keyrouter: active`];
+				// The reminder matters only when the level is not the default: it is the
+				// answer to "why do I no longer see rotation lines?".
+				const levelSuffix =
+					config.notifications && config.notifications !== "all"
+						? ` (notifications: ${config.notifications})`
+						: "";
+				const lines: string[] = [`🔑 keyrouter: active${levelSuffix}`];
 				for (const [providerId, rt] of runtimes) {
 					const current = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
 					// `source` is pi's own vocabulary (runtime / stored / environment).
