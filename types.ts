@@ -37,6 +37,9 @@ export interface AccountEntry {
 /** Which mechanism a pool uses. Both kinds share the rotation machinery. */
 export type PoolKind = "keys" | "oauth";
 
+/** How the next entry is chosen at a turn boundary. See `ProviderConfig.strategy`. */
+export type RotationStrategy = "failover" | "round-robin" | "stalest-first" | "random";
+
 /** Configuration for a single provider. */
 export interface ProviderConfig {
 	/** Provider id pi uses: built-in (`google`), a `models.json` id, or another
@@ -62,6 +65,22 @@ export interface ProviderConfig {
 	 * limit that switching keys cannot lift.
 	 */
 	rotateOnQuota?: boolean;
+	/**
+	 * How the next entry is picked at each turn boundary. Default "failover".
+	 *
+	 *   failover      stay on the current entry until it fails — the original behavior
+	 *   round-robin   advance to the next entry every turn, spreading load and
+	 *                 keeping every account exercised (and so refreshed)
+	 *   stalest-first the available entry whose token expires soonest — the account
+	 *                 most in need of a refresh serves this turn
+	 *   random        a uniformly random available entry other than the current one
+	 *
+	 * Rotation on failure still applies on top of every strategy: 429/401/quota/
+	 * refresh errors rotate immediately through the same path as before. A
+	 * strategy only decides the steady-state pick between healthy turns, and it
+	 * never selects an entry that is on cooldown.
+	 */
+	strategy?: RotationStrategy;
 	/**
 	 * Name of the entry that was active when the last session ended. Read back so
 	 * the next session resumes here instead of restarting at the first entry.

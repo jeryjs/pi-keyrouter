@@ -38,6 +38,8 @@
 //         { "name": "third", "credential": "@~/.pi/accounts/cline3.json" }
 //       ],
 //       "rotateOnQuota": true
+//       "strategy": "stalest-first" // per-provider: "failover" | "round-robin" |
+//                               //   "stalest-first" | "random" — see README
 //     }
 //   ]
 // }
@@ -79,6 +81,7 @@ import type {
 	OAuthCredential,
 	PoolKind,
 	ProviderConfig as ProviderPool,
+	RotationStrategy,
 } from "./types.ts";
 import { validateIdentityPath } from "./identity.ts";
 
@@ -409,6 +412,42 @@ export function loadConfig(_cwd?: string, home?: string): KeyRouterConfig {
 	}
 }
 
+const STRATEGIES: ReadonlySet<string> = new Set([
+	"failover",
+	"round-robin",
+	"stalest-first",
+	"random",
+]);
+
+/**
+ * Resolve a pool's `strategy`. The default is "failover" — the historical
+ * behavior — so an absent or mistyped value never changes rotation for a pool
+ * whose owner did not ask for it. `stalest-first` orders accounts by token
+ * expiry, which a `keys` pool does not have; rather than silently keeping the
+ * default, it degrades to the closest intent (spread usage) with a warning.
+ */
+function normalizeStrategy(
+	raw: unknown,
+	kind: PoolKind,
+	poolName: string,
+	warnings: string[],
+): RotationStrategy {
+	if (raw === undefined) return "failover";
+	if (typeof raw === "string" && STRATEGIES.has(raw)) {
+		if (raw === "stalest-first" && kind === "keys") {
+			warnings.push(
+				`"${poolName}": "stalest-first" orders accounts by token expiry, which a "keys" pool does not have — using "round-robin".`,
+			);
+			return "round-robin";
+		}
+		return raw as RotationStrategy;
+	}
+	warnings.push(
+		`"${poolName}": ${JSON.stringify(raw)} is not one of "failover", "round-robin", "stalest-first", "random" — using "failover".`,
+	);
+	return "failover";
+}
+
 function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 	const warnings: string[] = [];
 	const providers: ProviderPool[] = [];
@@ -453,7 +492,8 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				match: Array.isArray(raw.match) ? raw.match : [],
 				keys,
 				kind: "keys" satisfies PoolKind,
-				takeoverOAuth: raw.takeoverOAuth === true,
+			takeoverOAuth: raw.takeoverOAuth === true,
+			strategy: normalizeStrategy(raw.strategy, "keys" satisfies PoolKind, raw.name, warnings),
 				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
 			continue;
@@ -497,7 +537,8 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				kind: "oauth" satisfies PoolKind,
 				// Each OAuth account is a separate subscription, so an account-level
 				// limit is exactly when the next account is wanted. Default true.
-				rotateOnQuota: raw.rotateOnQuota !== false,
+			rotateOnQuota: raw.rotateOnQuota !== false,
+			strategy: normalizeStrategy(raw.strategy, "oauth" satisfies PoolKind, raw.name, warnings),
 				identityPath: identityPath.ok ? identityPath.path : undefined,
 				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
