@@ -79,6 +79,9 @@ credentials that must not be overridable by a repo you clone.
       ],
       // Optional: inject pooled keys even when pi has a stored OAuth login.
       "takeoverOAuth": false,
+      // Optional: how the next entry is picked at each turn boundary.
+      // "failover" (default) | "round-robin" | "stalest-first" | "random" — see Strategies.
+      "strategy": "failover",
       // Written and updated by keyrouter — the entry the last session ended on, so
       // the next one resumes here instead of restarting at "primary".
       // See "Resuming across sessions". Leave it out; it is not yours to set.
@@ -130,6 +133,31 @@ Two consequences of pi's retry policy worth knowing:
   leg needs no continuation.)
 - **Failed requests are not visible to `after_provider_response`.** The OpenAI SDK throws on non-2xx,
   so pi's response hook never fires. That is why errors are read from `message_end`.
+
+### Strategies
+
+By default a pool is a **failover** pool: keyrouter stays on the current entry until it fails,
+and only an error moves the pool on. Set `strategy` per provider to change *which entry serves each
+turn* — rotation on failure is unaffected and still applies on top of every strategy.
+
+| `strategy` | Behavior |
+|---|---|
+| `"failover"` (default) | Stay on the current entry until it fails. The original behavior. |
+| `"round-robin"` | Advance to the next entry at every turn boundary. Spreads load across the pool, and keeps every OAuth account exercised — and therefore refreshed through the normal capture machinery. |
+| `"stalest-first"` | Serve the turn with the available account whose token expires soonest: the account most in need of a refresh gets picked first. Under steady traffic it degenerates to round-robin. `accounts` pools only — on a `keys` pool it warns and behaves as `"round-robin"`. |
+| `"random"` | A uniformly random available entry other than the current one, for when a fixed rotation pattern is unwanted. |
+
+Two rules that hold for every strategy:
+
+- **Advancement happens only at turn boundaries, never mid-turn.** A turn is one logical unit of
+  work, so every request in it goes out on the entry that was installed when the turn started.
+- **Cooldowns still bind.** A strategy spreads load; it never selects an entry that is known to be
+  bad. And failure rotation wins: while a rotated-in replacement is still waiting for its retry
+  turn, the strategy does not move away from it.
+
+Strategy advancement is silent by design — the pool is doing what you asked, not reporting an
+event. It is visible in the trace (`PI_KEYROUTER_TRACE`), e.g.
+`advance cline home -> work (round-robin)`.
 
 ### Resuming across sessions
 
@@ -228,8 +256,6 @@ holds them and swaps them in.
 - `keys` and `accounts` are mutually exclusive for one provider.
 - `rotateOnQuota` (default `true`) decides whether an account-level limit rotates the pool. Each
   account is a separate subscription, so this defaults the opposite way from `keys` pools — see
-- `rotateOnQuota` (default `true`) decides whether an account-level limit rotates the pool. Each
-  account is a separate subscription, so this defaults the opposite way from `keys` pools — see
   [Rotation rules](#rotation-rules).
 - `identityPath` (optional) says where this provider's account identity lives inside a credential.
   See [Attributing a refreshed credential](#attributing-a-refreshed-credential).
@@ -250,6 +276,20 @@ otherwise still carry the access token from an account's **last login**. Since a
 short-lived (60 minutes for Cline), a stale copy means every account in the pool presents an
 expired token and the whole pool reads as dead. A dead refresh token is treated as a dead account,
 and the pool rotates away from it.
+
+**Idle accounts are refreshed at session start.** An account that sits in the pool unused goes
+through none of that — pi never sees it, so its stored copy keeps an expired access token and an
+unexercised refresh token, and whether that token still redeems weeks later is up to the provider.
+At `session_start`, keyrouter therefore asks **pi's own refresh implementation** — the provider's
+`oauth.refresh`, the same function pi's request path calls — to renew every *idle* account whose
+token has less than ~5 minutes of validity left, with pi's own 15-second exchange timeout, and
+writes the result back through the usual write-back rules. keyrouter still implements no part of
+OAuth. The *active* account is skipped: pi refreshes it at request time and the capture machinery
+syncs that; sweeping its pool copy as well would race pi's refresh of the same token — and for
+providers that rotate the refresh token on every exchange, each side would consume the other's
+token. The sweep is non-blocking and never touches `auth.json`, only the pool and
+`keyrouter.json`. An account whose refresh fails is marked like a request-time refresh failure and
+named in one notice: reviving a dead login still needs a `/login` only you can perform.
 
 The write-back is scoped and conservative: only accounts written as an **inline object** are
 updated (`$ENV` and `@file` references are left alone), only the credential fields change, and the

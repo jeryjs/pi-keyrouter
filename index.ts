@@ -41,12 +41,14 @@ import {
 	notifyOverloaded,
 	notifyExhausted,
 	notifyOAuthUnsupported,
+	rotationIsNotifiable,
 } from "./notification.ts";
 import {
 	captureCredential,
 	clearOverlay,
 	credentialStore,
 	installCredential,
+	isOAuthCredential,
 	type CredentialStoreApi,
 } from "./oauth.ts";
 import {
@@ -64,6 +66,7 @@ import {
 	markOk,
 	markOverloaded,
 	pickNextKey,
+	pickStrategyNext,
 	recordUse,
 } from "./rotation.ts";
 import type {
@@ -73,6 +76,7 @@ import type {
 	ProviderConfig as ProviderPoolConfig,
 	RotationEvent,
 	RotationReason,
+	RotationStrategy,
 } from "./types.ts";
 /**
  * Optional trace sink. Set `PI_KEYROUTER_TRACE=/path/to/log` to record pool
@@ -185,6 +189,8 @@ interface ProviderRuntime {
 	 * keys pools, where a quota error is account-wide and switching cannot lift it.
 	 */
 	rotateOnQuota: boolean;
+	/** How the next entry is picked at each turn boundary (per-pool setting). */
+	strategy: RotationStrategy;
 	/** Entries for both kinds: the shared rotation machinery operates on these. */
 	keys: KeyState[];
 	/**
@@ -284,6 +290,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			kind: providerCfg.kind,
 			// Only meaningful for OAuth pools; false for keys pools by construction.
 			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
+			strategy: providerCfg.strategy ?? "failover",
 			keys:
 				providerCfg.kind === "oauth"
 					? initAccountStates(providerCfg.accounts ?? [])
@@ -938,6 +945,168 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * Perform the actual swap to a chosen entry, shared by failure rotation and
+	 * strategy advancement so the two paths can never drift apart. The
+	 * capture-before-leave → install → capture-after-install sequence is what
+	 * keeps pool copies correct; it must stay identical everywhere it runs.
+	 *
+	 * Returns the entry that became active, or undefined when the install failed
+	 * — in which case nothing was changed and the caller must not behave as if a
+	 * rotation had happened.
+	 */
+	async function swapToEntry(
+		rt: ProviderRuntime,
+		idx: number,
+		ctx: ExtensionContext,
+	): Promise<KeyState | undefined> {
+		const entry = rt.keys[idx];
+		if (!entry) return undefined;
+		if (rt.kind === "oauth") {
+			// 1. Preserve whatever pi refreshed for the account we are leaving.
+			await captureAccount(rt, rt.keys[rt.currentIndex]);
+			// 2. Install the next account.
+			if (!(await applyAccount(rt.providerId, entry, ctx))) return undefined;
+			setActive(rt, idx);
+			recordUse(entry);
+			// 3. Read it back: pi may normalize or merge the blob, and this copy is
+			//    what a later return to this account will install.
+			await captureAccount(rt, entry);
+		} else {
+			if (!(await applyKey(rt.providerId, entry.value, ctx))) return undefined;
+			setActive(rt, idx);
+			recordUse(entry);
+		}
+		return entry;
+	}
+
+	/**
+	 * Advance a pool to the entry its strategy picks for the coming turn.
+	 *
+	 * Runs at `before_agent_start` — pi's turn boundary, the only moment a swap
+	 * is safe. Within a turn, every request must go out on the entry installed
+	 * when that turn started; swapping mid-turn would churn credential installs
+	 * under a live agent loop and split one logical unit of work across accounts.
+	 * (pi's sessions run one request loop at a time — subagent turns happen
+	 * while their parent is blocked in a tool call — so a turn boundary never
+	 * coincides with an in-flight request of the same session.)
+	 *
+	 * Not a rotation: nothing failed, so there is no notification and no retry
+	 * turn to request. The swap itself is exactly the failure path's, via
+	 * `swapToEntry`. Cooldowns still bind — a strategy spreads load; it never
+	 * walks the pool onto an entry known to be bad.
+	 *
+	 * Skipped while `pendingContinue` is set: a failure rotation is waiting for
+	 * its retry to run on the entry it just installed, and advancing again would
+	 * discard that choice before it was ever used.
+	 */
+	async function advanceForStrategy(ctx: ExtensionContext): Promise<void> {
+		if (!config) return;
+		const now = Date.now();
+		for (const rt of runtimes.values()) {
+			if (rt.strategy === "failover") continue;
+			if (rt.currentIndex < 0 || rt.keys.length < 2) continue; // not bootstrapped / nothing to advance to
+			if (rt.pendingContinue) continue;
+			if (rt.kind === "oauth" && !storeApi) continue;
+			const idx = pickStrategyNext(rt.keys, rt.currentIndex, rt.strategy, now);
+			const entry = idx >= 0 ? rt.keys[idx] : undefined;
+			if (!entry || idx === rt.currentIndex || !isAvailable(entry, now)) continue;
+			const previousName = rt.keys[rt.currentIndex]?.name ?? "(none)";
+			const swapped = await swapToEntry(rt, idx, ctx);
+			if (!swapped) continue;
+			trace(`advance ${rt.providerId} ${previousName} -> ${swapped.name} (${rt.strategy})`);
+		}
+	}
+
+	/**
+	 * Refresh the credentials of IDLE pool accounts at session start, so an
+	 * account that has not served a request in weeks is not discovered dead
+	 * mid-task.
+	 *
+	 * pi refreshes only the credential it holds, lazily, at request time. An
+	 * account sitting unused in the pool never goes through that path, so its
+	 * copy keeps an expired access token and an unexercised refresh token —
+	 * whether that token still redeems weeks later is purely provider policy.
+	 * This sweep is the fix for the pool's idle entries, and it uses pi's own
+	 * refresh implementation (the provider's `oauth.refresh`, the same function
+	 * pi's request path calls), so keyrouter still owns no part of OAuth.
+	 *
+	 * Mimics pi's request-path refresh exactly (pi-ai `auth/resolve.js`): same
+	 * threshold (refresh when fewer than ~5 minutes of validity remain), same
+	 * 15-second cap on the exchange, and the returned credential replaces the
+	 * pool copy wholesale — pi's own refreshers rebuild the blob, and the
+	 * config write-back merges it over the stored form, preserving
+	 * provider-specific fields such as `accountId`.
+	 *
+	 * The ACTIVE account is skipped on purpose. pi owns it: it is refreshed at
+	 * request time and captured when keyrouter leaves it. Sweeping its pool copy
+	 * as well would race pi's own refresh of the same token — and for providers
+	 * that rotate the refresh token on every exchange (openai-codex), the two
+	 * exchanges would each consume the other's token.
+	 *
+	 * Non-blocking by design: fired without awaiting from `session_start`,
+	 * because it only reads and writes the pool and `keyrouter.json` — never
+	 * pi's credential store — so it cannot interfere with the first turn.
+	 *
+	 * A failed exchange marks the entry exactly like a request-time refresh
+	 * failure (status + cooldown) and says so once: reviving a dead login needs
+	 * an interactive /login only the user can perform. Persistence follows the
+	 * usual write-back rules, so an account sourced from `$ENV`/`@file` is
+	 * refreshed in memory for this session while the user's indirection is left
+	 * alone on disk.
+	 */
+	async function sweepIdleAccounts(ctx: ExtensionContext): Promise<void> {
+		if (!config) return;
+		// pi's own expiry window and exchange timeout — see pi-ai auth/resolve.js:
+		// DEFAULT_OAUTH_MINIMUM_VALIDITY_MS / DEFAULT_OAUTH_REFRESH_TIMEOUT_MS.
+		const MIN_VALIDITY_MS = 5 * 60 * 1000;
+		const REFRESH_TIMEOUT_MS = 15_000;
+		const now = Date.now();
+		for (const rt of runtimes.values()) {
+			if (rt.kind !== "oauth" || rt.currentIndex < 0) continue;
+			// pi's own refresh implementation, reached exactly the way `skipReason`
+			// reads the provider: through the registry facade, capability-checked.
+			const oauth = ctx.modelRegistry.getProvider(rt.providerId)?.auth?.oauth;
+			if (typeof oauth?.refresh !== "function") {
+				trace(`sweep skip ${rt.providerId} (no OAuth refresh available)`);
+				continue;
+			}
+			for (const entry of rt.keys) {
+				if (entry === rt.keys[rt.currentIndex]) continue; // pi owns the active one
+				const credential = entry.credential;
+				if (!credential || typeof credential.expires !== "number") continue;
+				if (now + MIN_VALIDITY_MS < credential.expires) continue; // still has life
+				try {
+					const fresh = await oauth.refresh(credential, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
+					if (!isOAuthCredential(fresh)) {
+						trace(`sweep skip ${rt.providerId} ${entry.name} (refresh returned no usable credential)`);
+						continue;
+					}
+					entry.credential = fresh;
+					persistCredential(rt, entry.name, fresh);
+					trace(
+						`sweep refreshed ${rt.providerId} ${entry.name} ` +
+							`(expires in ${Math.round((fresh.expires - Date.now()) / 60_000)}m)`,
+					);
+				} catch (error) {
+					const detail = error instanceof Error ? error.message : String(error);
+					markBad(entry, "refresh-failed", config.cooldownMs, Date.now());
+					trace(`sweep refresh failed ${rt.providerId} ${entry.name} (${detail})`);
+					// Needs the user to act, exactly like a request-time refresh failure:
+					// visible at "all" and "quiet", hidden at "silent".
+					if (rotationIsNotifiable(config.notifications, "refresh-failed")) {
+						warn(
+							uiCtx,
+							earlyWarnings,
+							`🔑 keyrouter: ${rt.providerId} account "${entry.name}" could not be refreshed at startup — ` +
+								`the login is likely dead. Rotation will skip it; /login that account to revive it.`,
+						);
+					}
+				}
+			}
+		}
+	}
+
+	/**
 	 * Activate the router: load config (once), bootstrap all providers, and set
 	 * the first key of each pool. Idempotent — safe on every before_agent_start.
 	 */
@@ -1045,6 +1214,11 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		await activate(ctx);
 		await reconcileCredentials();
 		await activate(ctx);
+		// Keep idle pool accounts alive without holding up the session: the sweep
+		// never touches pi's store, so it cannot race the first turn.
+		void sweepIdleAccounts(ctx).catch((error) => {
+			trace(`sweep error ${error instanceof Error ? error.message : String(error)}`);
+		});
 	});
 
 	// Lazy bootstrap: also fire on every turn. This handles /reload (which
@@ -1058,6 +1232,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		// inside `activate` matters — `activate` short-circuits for every already-
 		// bootstrapped provider, and `/login` is exactly the case that got skipped.
 		await reconcileCredentials();
+		// Non-failover strategies pick their entry for the coming turn here, at the
+		// only boundary where a swap is safe.
+		await advanceForStrategy(ctx);
 	});
 
 	// Success clears a key's cooldown without touching rotation position, so a
@@ -1179,25 +1356,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		// another cooldown is not worth an extra request.
 		const wantsContinue = isAvailable(nextKey, Date.now());
 
-		if (rt.kind === "oauth") {
-			// 1. Preserve whatever pi refreshed for the account we are leaving.
-			await captureAccount(rt, currentKey);
-			// 2. Install the next account.
-			if (!(await applyAccount(providerId, nextKey, ctx))) return;
-			setActive(rt, nextIdx);
-			recordUse(nextKey);
-			// 3. Read it back: pi may normalize or merge the blob, and this copy is
-			//    what a later return to this account will install.
-			await captureAccount(rt, nextKey);
-			rt.pendingContinue = wantsContinue;
-			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
-		} else {
-			if (!(await applyKey(providerId, nextKey.value, ctx))) return;
-			setActive(rt, nextIdx);
-			recordUse(nextKey);
-			rt.pendingContinue = wantsContinue;
-			trace(`rotate ${providerId} ${previousName} -> ${nextKey.name} (${status} ${reason})`);
-		}
+		const swapped = await swapToEntry(rt, nextIdx, ctx);
+		if (!swapped) return;
+		rt.pendingContinue = wantsContinue;
+		trace(`rotate ${providerId} ${previousName} -> ${swapped.name} (${status} ${reason})`);
 
 		// Notify with a single themeable line (falls back silently without UI)
 		if (uiCtx) {

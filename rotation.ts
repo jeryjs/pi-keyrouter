@@ -12,7 +12,7 @@
 //    soonest (may need to wait).
 // 4. If there are no keys, return null.
 
-import type { KeyState, OAuthCredential, RotationReason } from "./types.ts";
+import type { KeyState, OAuthCredential, RotationReason, RotationStrategy } from "./types.ts";
 
 /** Build initial state from a list of key values (API-key pools). */
 export function initKeyStates(
@@ -163,6 +163,69 @@ export function matchProvider<T extends { name: string; match: string[] }>(
     }
   }
   return undefined;
+}
+
+/**
+ * Pick the entry a non-failover strategy should serve the next turn with.
+ *
+ * Returns the index to switch to — which may be `currentIndex` itself when the
+ * strategy is already satisfied (staying is a no-op the caller can skip) — or
+ * -1 when there is nothing sensible to do. An entry that is on cooldown or in
+ * an overload window is never selected: a strategy may spread load, but it must
+ * not walk the pool onto an entry known to be bad. Failure rotation is NOT
+ * affected by any of this and keeps using `pickNextKey` as before.
+ *
+ *   round-robin   the next available entry in cycle order — `pickNextKey` from the
+ *                 position after the current one, which already skips cooled
+ *                 entries. May legitimately return `currentIndex` when nothing
+ *                 else is available.
+ *   stalest-first the available entry whose token expires soonest. Includes the
+ *                 current entry on purpose: if IT is the stalest, staying is
+ *                 correct — the next request refreshes it.
+ *   random        a uniformly random available entry OTHER than the current
+ *                 one, so two consecutive turns never repeat one entry; when
+ *                 the current entry is the only one available, it stays.
+ */
+export function pickStrategyNext(
+  states: KeyState[],
+  currentIndex: number,
+  strategy: RotationStrategy,
+  now: number,
+): number {
+  if (states.length === 0) return -1;
+  if (strategy === "round-robin") return pickNextKey(states, currentIndex + 1, now);
+  if (strategy === "stalest-first") return pickStalest(states, now);
+  return pickRandom(states, currentIndex, now);
+}
+
+function pickStalest(states: KeyState[], now: number): number {
+  let bestIdx = -1;
+  let bestExpires = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < states.length; i++) {
+    const s = states[i];
+    if (!s || !isAvailable(s, now)) continue;
+    const expires = s.credential?.expires;
+    if (typeof expires !== "number") continue;
+    if (expires < bestExpires) {
+      bestExpires = expires;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx >= 0) return bestIdx;
+  // No entry carries an expiry (all credentials absent — normalize drops those,
+  // so this is defensive): behave like round-robin so the strategy still spreads.
+  return pickNextKey(states, 0, now);
+}
+
+function pickRandom(states: KeyState[], currentIndex: number, now: number): number {
+  const candidates: number[] = [];
+  for (let i = 0; i < states.length; i++) {
+    if (i === currentIndex) continue;
+    const s = states[i];
+    if (s && isAvailable(s, now)) candidates.push(i);
+  }
+  if (candidates.length === 0) return currentIndex;
+  return candidates[Math.floor(Math.random() * candidates.length)] ?? currentIndex;
 }
 
 /**

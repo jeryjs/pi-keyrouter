@@ -31,6 +31,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fails. `/keyrouter status` shows the active level, and the trace sink records every decision
   regardless of level.
 
+- **`"strategy"` config setting per provider — `"failover"` (default), `"round-robin"`,
+  `"stalest-first"`, or `"random"` — decides which pool entry serves each turn.** The default is
+  the historical behavior: stay on the current entry until it fails. `round-robin` advances at every
+  turn boundary, spreading load and keeping every OAuth account exercised (and so refreshed by the
+  normal capture machinery); `stalest-first` picks the available account whose token expires soonest,
+  so the account most in need of a refresh serves the turn; `random` picks a uniformly random
+  available entry, for when a fixed rotation pattern is unwanted. Advancement happens only at turn
+  boundaries — never mid-turn — and rotation on failure is unchanged and still applies on top of
+  every strategy. Cooldowns bind for strategies exactly as they do for failure rotation, and
+  `"stalest-first"` on a `keys` pool (which has no token expiry to order by) warns and behaves as
+  `"round-robin"`.
+
+- **Idle OAuth accounts are refreshed at session start, through pi's own refresh implementation.**
+  An account that sits in the pool unused is never touched by pi, so its stored copy keeps an
+  expired access token and an unexercised refresh token — whether that token still redeems after
+  weeks of disuse is up to the provider, which is exactly how pooled logins quietly die. At
+  `session_start`, keyrouter now renews every *idle* account whose token has less than ~5 minutes
+  of validity left, calling the provider's `oauth.refresh` — the same function pi's request path
+  calls — with pi's own 15-second exchange timeout, and persists the result through the usual
+  write-back rules. keyrouter still implements no part of OAuth. The active account is skipped:
+  pi refreshes it at request time and the existing capture machinery syncs it. The sweep is
+  non-blocking (it never touches `auth.json`, only the pool and `keyrouter.json`), and an account
+  whose refresh fails is marked like a request-time refresh failure and named in one notice —
+  reviving a dead login still needs an interactive `/login`.
 ## [1.4.0] — 2026-10-15
 
 ### Fixed
