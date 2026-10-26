@@ -87,7 +87,8 @@ credentials that must not be overridable by a repo you clone.
   ],
   "maxRetries": 3,            // rotations per provider before giving up
   "cooldownMs": 60000,        // how long a failed key stays bad
-  "overloadedCooldownMs": 30000 // provider-wide pause on "overloaded"/529
+  "overloadedCooldownMs": 30000, // provider-wide pause on "overloaded"/529
+  "notifications": "all"      // status-line volume: "all" | "quiet" | "silent"
 }
 ```
 
@@ -389,8 +390,21 @@ cline (oauth, active: home, installed: yes, source: stored)
     home  uses=2 fails=0 status=ok expires=in 12m
 ```
 
-Rotations, overloads and exhaustion each notify one themeable line. In headless/print mode there is
-no UI, so set `PI_KEYROUTER_TRACE=<file>` to log decisions (credential **names** only, never values):
+Rotations, overloads and exhaustion each notify one themeable line. **`notifications`** sets how much of
+that reaches you — `"all"` (default), `"quiet"`, or `"silent"`:
+
+| Event | `all` | `quiet` | `silent` |
+|---|---|---|---|
+| rotation for `rate-limited` — the entry cools down and rejoins on its own | shown | silent | silent |
+| provider `overloaded` — no key change, pi retries on its own | shown | silent | silent |
+| rotation for `unauthorized` / `quota` / `refresh-failed` — the credential needs you (replace the key, top up the account, re-login) | shown | shown | silent |
+| pool exhausted — the request you are waiting on actually fails | shown | shown | shown |
+
+Pool exhaustion is never silenced: hiding the one event where the request dies would only make the
+provider's own error look unexplained. `/keyrouter status` names the active level whenever it is not
+the default. In headless/print mode there is
+no UI, so set `PI_KEYROUTER_TRACE=<file>` to log decisions (credential **names** only, never values) —
+the trace records every decision regardless of the level:
 
 ```
 2026-... bootstrap tokenharbor -> primary
@@ -440,7 +454,7 @@ node test/unit-oauth.mjs                     # config parsing, store guards, /ke
 node test/verify-runtime-credentials.mjs     # probes pi's credential-store behaviour
 node test/oauth-fixture-smoke.mjs            # proves the OAuth fixture works WITHOUT keyrouter
 node test/unit-identity.mjs                  # credential->account attribution, incl. the incident replay
-node test/run.mjs                            # end-to-end, 32 cases
+node test/run.mjs                            # end-to-end, 37 cases
 ```
 
 Slash commands only exist in the interactive TUI, so `/keyrouter account` cannot be reached from a
