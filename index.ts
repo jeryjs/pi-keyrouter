@@ -238,6 +238,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	const injected = new Set<string>();
 	/** OAuth pools that installed an account in THIS process. */
 	const installedAccounts = new Set<string>();
+	/**
+	 * Providers with a startup-sweep refresh exchange in flight. Consulted by
+	 * `advanceForStrategy` so a turn-boundary swap never installs an account
+	 * whose refresh the sweep is mid-way through — see `sweepIdleAccounts`.
+	 */
+	const sweepingProviders = new Set<string>();
 	let uiCtx: ExtensionUIContext | undefined;
 	/** Providers whose config error we have already reported once. */
 	const skipReported = new Set<string>();
@@ -997,7 +1003,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 *
 	 * Skipped while `pendingContinue` is set: a failure rotation is waiting for
 	 * its retry to run on the entry it just installed, and advancing again would
-	 * discard that choice before it was ever used.
+	 * discard that choice before it was ever used. Also skipped while a
+	 * startup-sweep refresh is in flight for the pool (`sweepingProviders`):
+	 * installing a mid-refresh account would double-consume its refresh token
+	 * on providers that rotate it.
 	 */
 	async function advanceForStrategy(ctx: ExtensionContext): Promise<void> {
 		if (!config) return;
@@ -1007,6 +1016,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			if (rt.currentIndex < 0 || rt.keys.length < 2) continue; // not bootstrapped / nothing to advance to
 			if (rt.pendingContinue) continue;
 			if (rt.kind === "oauth" && !storeApi) continue;
+			if (sweepingProviders.has(rt.providerId)) {
+				// A startup-sweep exchange is in flight for this pool; installing a
+				// mid-refresh account would double-consume its refresh token on
+				// rotating providers. One turn of delay is harmless.
+				trace(`advance skip ${rt.providerId} (startup sweep in flight)`);
+				continue;
+			}
 			const idx = pickStrategyNext(rt.keys, rt.currentIndex, rt.strategy, now);
 			const entry = idx >= 0 ? rt.keys[idx] : undefined;
 			if (!entry || idx === rt.currentIndex || !isAvailable(entry, now)) continue;
@@ -1046,6 +1062,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 * Non-blocking by design: fired without awaiting from `session_start`,
 	 * because it only reads and writes the pool and `keyrouter.json` — never
 	 * pi's credential store — so it cannot interfere with the first turn.
+	 * It is serialized against strategy advancement per provider
+	 * (`sweepingProviders`), so the two writers never target the same account.
 	 *
 	 * A failed exchange marks the entry exactly like a request-time refresh
 	 * failure (status + cooldown) and says so once: reviving a dead login needs
@@ -1065,43 +1083,71 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			if (rt.kind !== "oauth" || rt.currentIndex < 0) continue;
 			// pi's own refresh implementation, reached exactly the way `skipReason`
 			// reads the provider: through the registry facade, capability-checked.
+			// The registry-facing contract is `refresh` — pi-ai's OAuthAuth — for
+			// built-in AND extension-registered providers: pi's provider composer
+			// adapts a registration's `refreshToken` hook into it
+			// (`refresh: (c, s) => config.refreshToken(c, s)`), which is why the
+			// e2e fixture's `refreshToken` hook is refreshed through `refresh` here.
 			const oauth = ctx.modelRegistry.getProvider(rt.providerId)?.auth?.oauth;
 			if (typeof oauth?.refresh !== "function") {
 				trace(`sweep skip ${rt.providerId} (no OAuth refresh available)`);
 				continue;
 			}
-			for (const entry of rt.keys) {
-				if (entry === rt.keys[rt.currentIndex]) continue; // pi owns the active one
-				const credential = entry.credential;
-				if (!credential || typeof credential.expires !== "number") continue;
-				if (now + MIN_VALIDITY_MS < credential.expires) continue; // still has life
-				try {
-					const fresh = await oauth.refresh(credential, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
-					if (!isOAuthCredential(fresh)) {
-						trace(`sweep skip ${rt.providerId} ${entry.name} (refresh returned no usable credential)`);
-						continue;
-					}
-					entry.credential = fresh;
-					persistCredential(rt, entry.name, fresh);
-					trace(
-						`sweep refreshed ${rt.providerId} ${entry.name} ` +
-							`(expires in ${Math.round((fresh.expires - Date.now()) / 60_000)}m)`,
-					);
-				} catch (error) {
-					const detail = error instanceof Error ? error.message : String(error);
-					markBad(entry, "refresh-failed", config.cooldownMs, Date.now());
-					trace(`sweep refresh failed ${rt.providerId} ${entry.name} (${detail})`);
-					// Needs the user to act, exactly like a request-time refresh failure:
-					// visible at "all" and "quiet", hidden at "silent".
-					if (rotationIsNotifiable(config.notifications, "refresh-failed")) {
-						warn(
-							uiCtx,
-							earlyWarnings,
-							`🔑 keyrouter: ${rt.providerId} account "${entry.name}" could not be refreshed at startup — ` +
-								`the login is likely dead. Rotation will skip it; /login that account to revive it.`,
+			// Serialize with turn-boundary swaps: while an exchange for this provider
+			// is in flight, `advanceForStrategy` skips the pool, so a round-robin/
+			// random advancement can never install an account whose refresh the
+			// sweep is mid-way through — on rotating providers, two exchanges of one
+			// refresh token each consume the other. Failure rotation cannot be
+			// blocked (a failing turn needs a replacement now); its narrower residual
+			// is handled inside the loop, right after the exchange.
+			sweepingProviders.add(rt.providerId);
+			try {
+				for (const entry of rt.keys) {
+					if (entry === rt.keys[rt.currentIndex]) continue; // pi owns the active one
+					const credential = entry.credential;
+					if (!credential || typeof credential.expires !== "number") continue;
+					if (now + MIN_VALIDITY_MS < credential.expires) continue; // still has life
+					try {
+						const fresh = await oauth.refresh(credential, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
+						if (!isOAuthCredential(fresh)) {
+							trace(`sweep skip ${rt.providerId} ${entry.name} (refresh returned no usable credential)`);
+							continue;
+						}
+						// The exchange awaited, so rotation may have landed on this entry
+						// while it ran. If it became active, pi owns it now: write nothing, so
+						// the capture machinery stays the only writer for the active account.
+						// (When failure rotation installed the pre-sweep blob, that one
+						// request may still fail its lazy refresh and rotate away once — then
+						// the swept credential serves the later return. Self-healing, and the
+						// same behavior as picking any stale account.)
+						if (entry === rt.keys[rt.currentIndex]) {
+							trace(`sweep skip persist ${rt.providerId} ${entry.name} (became active mid-exchange)`);
+							continue;
+						}
+						entry.credential = fresh;
+						persistCredential(rt, entry.name, fresh);
+						trace(
+							`sweep refreshed ${rt.providerId} ${entry.name} ` +
+								`(expires in ${Math.round((fresh.expires - Date.now()) / 60_000)}m)`,
 						);
+					} catch (error) {
+						const detail = error instanceof Error ? error.message : String(error);
+						markBad(entry, "refresh-failed", config.cooldownMs, Date.now());
+						trace(`sweep refresh failed ${rt.providerId} ${entry.name} (${detail})`);
+						// Needs the user to act, exactly like a request-time refresh failure:
+						// visible at "all" and "quiet", hidden at "silent".
+						if (rotationIsNotifiable(config.notifications, "refresh-failed")) {
+							warn(
+								uiCtx,
+								earlyWarnings,
+								`🔑 keyrouter: ${rt.providerId} account "${entry.name}" could not be refreshed at startup — ` +
+									`the login is likely dead. Rotation will skip it; /login that account to revive it.`,
+							);
+						}
 					}
 				}
+			} finally {
+				sweepingProviders.delete(rt.providerId);
 			}
 		}
 	}

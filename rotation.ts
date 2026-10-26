@@ -193,7 +193,16 @@ export function pickStrategyNext(
   now: number,
 ): number {
   if (states.length === 0) return -1;
-  if (strategy === "round-robin") return pickNextKey(states, currentIndex + 1, now);
+  // Modulo, never a bare `currentIndex + 1`: `pickNextKey` treats its
+  // `preferredIndex` as the entry to try FIRST (branch 1), so an out-of-range
+  // index is not "the next one wrapped" — branch 1 finds nothing and the
+  // fallback scan restarts at index 1, re-checking the CURRENT entry before
+  // entry 0. A two-entry pool would then sit still forever, and larger pools
+  // would visit entry 0 last on every wrap. (The failure path's bare
+  // `currentIndex + 1` is unaffected: the entry being left is on cooldown, so
+  // the scan's early return of it can never happen.)
+  if (strategy === "round-robin")
+    return pickNextKey(states, (currentIndex + 1) % states.length, now);
   if (strategy === "stalest-first") return pickStalest(states, now);
   return pickRandom(states, currentIndex, now);
 }

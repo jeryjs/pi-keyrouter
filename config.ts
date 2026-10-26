@@ -24,7 +24,9 @@
 //   "maxRetries": 3,
 //   "cooldownMs": 60000,
 //   "overloadedCooldownMs": 30000,
-//   "notifications": "all"  // "all" | "quiet" | "silent" — status-line volume
+//   "notifications": "all",  // "all" | "quiet" | "silent" — status-line volume
+//   "strategy": "failover"  // per-provider: "failover" | "round-robin" |
+//                           //   "stalest-first" | "random" — see README
 // }
 //
 // Schema — OAuth account pool (mutually exclusive with `keys`):
@@ -37,7 +39,7 @@
 //         { "name": "home", "credential": "$CLINE_ACCOUNT_2" },
 //         { "name": "third", "credential": "@~/.pi/accounts/cline3.json" }
 //       ],
-//       "rotateOnQuota": true
+//       "rotateOnQuota": true,
 //       "strategy": "stalest-first" // per-provider: "failover" | "round-robin" |
 //                               //   "stalest-first" | "random" — see README
 //     }
