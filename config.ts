@@ -368,6 +368,63 @@ export function writeBackActive(
 	return { updated };
 }
 
+/**
+ * Write a pool's `strategy` back into `keyrouter.json`, in place.
+ *
+ * `/keyrouter strategy` persists here because a strategy is only useful if the
+ * next session starts with it — a change that dies with the process would make
+ * the command a lie. Setting `"failover"` DELETES the field rather than writing
+ * the word: absent already means failover (`normalizeStrategy`), so the file
+ * keeps only what the user actually chose. Same safety rules as the other
+ * write-backs — only this one field changes, the write is atomic and skipped
+ * when nothing moved, and a failure is reported rather than thrown.
+ *
+ * @returns the number of pools updated (0 when there was nothing to do)
+ */
+export function writeBackStrategy(
+	providerName: string,
+	strategy: RotationStrategy,
+	home?: string,
+): { updated: number } | { error: string } {
+	const file = configPath(undefined, home);
+	let rawText: string;
+	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
+	try {
+		rawText = fs.readFileSync(file, "utf-8");
+		parsed = JSON.parse(rawText) as typeof parsed;
+	} catch (error) {
+		return { error: `cannot read ${file}: ${(error as Error).message}` };
+	}
+
+	let updated = 0;
+	for (const provider of parsed.providers ?? []) {
+		if (provider?.name !== providerName) continue;
+		if (strategy === "failover") {
+			if (provider.strategy === undefined) continue;
+			delete provider.strategy;
+		} else {
+			if (provider.strategy === strategy) continue;
+			provider.strategy = strategy;
+		}
+		updated += 1;
+	}
+	if (updated === 0) return { updated: 0 };
+
+	const temp = `${file}.keyrouter.tmp`;
+	try {
+		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(temp, file);
+	} catch (error) {
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			// best effort cleanup
+		}
+		return { error: `cannot write ${file}: ${(error as Error).message}` };
+	}
+	return { updated };
+}
+
 export function defaultConfig(): KeyRouterConfig {
 	return {
 		providers: [],
@@ -414,7 +471,7 @@ export function loadConfig(_cwd?: string, home?: string): KeyRouterConfig {
 	}
 }
 
-const STRATEGIES: ReadonlySet<string> = new Set([
+export const STRATEGIES: ReadonlySet<string> = new Set([
 	"failover",
 	"round-robin",
 	"stalest-first",
@@ -428,7 +485,7 @@ const STRATEGIES: ReadonlySet<string> = new Set([
  * expiry, which a `keys` pool does not have; rather than silently keeping the
  * default, it degrades to the closest intent (spread usage) with a warning.
  */
-function normalizeStrategy(
+export function normalizeStrategy(
 	raw: unknown,
 	kind: PoolKind,
 	poolName: string,

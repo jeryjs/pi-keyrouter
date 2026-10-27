@@ -43,6 +43,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `"stalest-first"` on a `keys` pool (which has no token expiry to order by) warns and behaves as
   `"round-robin"`.
 
+- **`/keyrouter strategy <provider> [strategy]` shows or changes a pool's strategy live.** With
+  no arguments it lists every pool's strategy; naming a pool reports it; naming a pool and a value
+  sets it. A change never rotates immediately — strategies act only at turn boundaries — and it is
+  saved to `~/.pi/keyrouter.json`, so it survives a reload and a restart; setting `"failover"`
+  removes the field, since absent already means failover. On a `keys` pool the command reuses the
+  loader's own degradation (`stalest-first` → `round-robin` with a warning) and persists the
+  effective value so a reload does not warn again. A non-default strategy now also appears in
+  `/keyrouter status`, and the completion menu offers pools and the strategy values valid for each
+  pool's kind.
+
 - **Idle OAuth accounts are refreshed at session start, through pi's own refresh implementation.**
   An account that sits in the pool unused is never touched by pi, so its stored copy keeps an
   expired access token and an unexercised refresh token — whether that token still redeems after

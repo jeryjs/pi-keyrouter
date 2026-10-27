@@ -138,7 +138,8 @@ Two consequences of pi's retry policy worth knowing:
 
 By default a pool is a **failover** pool: keyrouter stays on the current entry until it fails,
 and only an error moves the pool on. Set `strategy` per provider to change *which entry serves each
-turn* — rotation on failure is unaffected and still applies on top of every strategy.
+turn* — rotation on failure is unaffected and still applies on top of every strategy. It can
+also be changed live with `/keyrouter strategy` (see [Commands](#commands)).
 
 | `strategy` | Behavior |
 |---|---|
@@ -390,13 +391,15 @@ error, rather than leaving you logged out.
 /keyrouter reload     re-read ~/.pi/keyrouter.json
 /keyrouter reset      hand providers back to pi's own credentials immediately
 /keyrouter account <provider> [name|index]    pin a specific key or account
+/keyrouter strategy <provider> [strategy]    show or set a pool's rotation strategy
 ```
 
 `reset` also clears each pool's saved `active` position, so the next session starts at the first
 entry rather than resuming onto the credential you just handed back.
 
-The completion menu fills the rest in: the four subcommands first, then the configured pools after
-`account`, then that pool's entries. Entry names are matched case-insensitively, and the pool's
+The completion menu fills the rest in: the five subcommands first, then the configured pools after `account` or
+`strategy`, then that pool's entries for `account`, or the strategy values valid for that pool's
+kind for `strategy`. Entry names are matched case-insensitively, and the pool's
 current `active` entry is labelled as such. Suggestions stop as soon as the command is complete, so
 `status` and `reload` never offer operands.
 
@@ -417,6 +420,26 @@ continues from the pinned position on the next failure, so this is a nudge rathe
 Installs go through exactly the same path as automatic rotation, including capturing pi's rotated
 blob before leaving the previous credential. The pin is also saved as the pool's `active`, so it
 survives a restart.
+
+`strategy` shows or changes how a pool picks its next entry at a turn boundary. With no arguments
+it lists every pool; naming only the pool reports it; naming a pool and a value sets it:
+
+```
+/keyrouter strategy                  → strategies
+                                         cline (oauth): stalest-first
+                                         tokenharbor (keys): round-robin
+                                       Set one: /keyrouter strategy <provider> <failover|round-robin|stalest-first|random>
+/keyrouter strategy cline             → cline (oauth) — strategy: stalest-first
+                                       Choose one: /keyrouter strategy cline <failover|round-robin|stalest-first|random>
+/keyrouter strategy cline random     → cline strategy: stalest-first -> random (applies from the next turn boundary).
+```
+
+The change never rotates immediately — strategies act only at turn boundaries — and it is saved to
+`~/.pi/keyrouter.json`, so it survives a reload and a restart. Setting `failover` removes the field
+from the file (absent already means failover). On a `keys` pool, `stalest-first` is not even
+offered: it orders by token expiry, which keys do not have, so it degrades to `round-robin` with a
+warning — the command stores the effective value so a later reload does not warn again. A strategy
+other than `failover` also shows up in `/keyrouter status` next to the pool's `source`.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and

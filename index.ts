@@ -35,7 +35,15 @@
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync } from "node:fs";
-import { loadConfig, configPath, writeBackCredentials, writeBackActive } from "./config.ts";
+import {
+	loadConfig,
+	configPath,
+	writeBackCredentials,
+	writeBackActive,
+	writeBackStrategy,
+	normalizeStrategy,
+	STRATEGIES,
+} from "./config.ts";
 import {
 	notifyRotation,
 	notifyOverloaded,
@@ -1488,7 +1496,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("keyrouter", {
-		description: "manage credential pools (status, reload, reset, account)",
+		description: "manage credential pools (status, reload, reset, account, strategy)",
 		getArgumentCompletions: (prefix) =>
 			commandCompletions(prefix, config?.providers ?? loadConfig().providers),
 		handler: async (args, ctx) => {
@@ -1530,9 +1538,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					const auth = ctx.modelRegistry.getProviderAuthStatus(providerId);
 					const installed = rt.kind === "oauth" ? rt.injecting : auth.source === "runtime";
 					lines.push("");
+					// Strategy only when it is not the default, so pools that never asked
+					// for one keep the status line they have always had.
+					const strategySuffix = rt.strategy !== "failover" ? `, strategy: ${rt.strategy}` : "";
 					lines.push(
 						`  ${providerId} (${rt.kind}, active: ${current?.name ?? "(none)"}, ` +
-							`installed: ${installed ? "yes" : "no"}, source: ${auth.source ?? "none"})`,
+							`installed: ${installed ? "yes" : "no"}, source: ${auth.source ?? "none"}${strategySuffix})`,
 					);
 					for (const k of rt.keys) {
 						const marker = k === current ? "→" : "•";
@@ -1711,6 +1722,99 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
+			if (sub === "strategy") {
+				// Show or change a pool's rotation strategy. A change never rotates
+				// immediately — strategies act at turn boundaries — it only re-points
+				// what the next boundary will do.
+				if (!config || runtimes.size === 0) await activate(ctx);
+				const wanted = parsed.args[0];
+				const token = parsed.args[1]?.toLowerCase();
+				if (!wanted) {
+					// No argument: one line per pool, a strategy-only status.
+					const lines: string[] = [];
+					for (const [providerId, rt] of runtimes) {
+						lines.push(`  ${providerId} (${rt.kind}): ${rt.strategy}`);
+					}
+					ctx.ui.notify(
+						lines.length > 0
+							? `🔑 keyrouter: strategies\n${lines.join("\n")}\n` +
+								`Set one: /keyrouter strategy <provider> <${[...STRATEGIES].join("|")}>`
+							: "🔑 keyrouter: no pools are active.",
+						"info",
+					);
+					return;
+				}
+
+				const providerId = resolveProviderId(ctx.modelRegistry, wanted);
+				const rt = runtimes.get(providerId);
+				if (!rt) {
+					const known = [...runtimes.keys()];
+					ctx.ui.notify(
+						`🔑 keyrouter: "${wanted}" is not an active pool. ` +
+							(known.length > 0 ? `Active: ${known.join(", ")}.` : "No pools are active."),
+						"warning",
+					);
+					return;
+				}
+
+				// Report the pool instead of guessing when no strategy is named.
+				if (!token) {
+					ctx.ui.notify(
+						`🔑 keyrouter: ${providerId} (${rt.kind}) — strategy: ${rt.strategy}\n` +
+							`Choose one: /keyrouter strategy ${providerId} <${[...STRATEGIES].join("|")}>`,
+						"info",
+					);
+					return;
+				}
+
+				if (!STRATEGIES.has(token)) {
+					ctx.ui.notify(
+						`🔑 keyrouter: "${token}" is not a strategy. Valid: ${[...STRATEGIES].join(", ")}.`,
+						"warning",
+					);
+					return;
+				}
+
+				// Reuse the loader's own resolution so the command degrades
+				// "stalest-first" on a keys pool exactly like a config reload — and
+				// persists the EFFECTIVE value, so a later reload does not re-warn.
+				const warnings: string[] = [];
+				// The pool's WRITTEN name, matching the loader's own warnings (config
+				// vocabulary), not the possibly-canonicalized id.
+				const effective = normalizeStrategy(token, rt.kind, rt.configName, warnings);
+				for (const w of warnings) ctx.ui.notify(`🔑 keyrouter: ${w}`, "warning");
+
+				const previous = rt.strategy;
+				if (effective === previous) {
+					// No-op set: report it instead of claiming a change, exactly like
+					// `account` short-circuits "already using X".
+					ctx.ui.notify(`🔑 keyrouter: ${providerId} is already on strategy ${effective}.`, "info");
+					return;
+				}
+				rt.strategy = effective;
+				// Find the config entry by the name the user WROTE, not the resolved id —
+				// `resolveProviderId` may have canonicalized it (`z-ai` -> `zai`) and the
+				// config file is never rewritten to match (same rule as `writeBackActive`).
+				const pool = config?.providers.find((p) => p.name === rt.configName);
+				if (pool) pool.strategy = effective;
+
+				const result = writeBackStrategy(rt.configName, effective);
+				if ("error" in result) {
+					ctx.ui.notify(
+						`🔑 keyrouter: could not save the strategy to ${configPath()} — ${result.error}. ` +
+							"The change applies to this session only.",
+						"warning",
+					);
+				}
+
+				trace(`strategy ${providerId} ${previous} -> ${effective} (/strategy)`);
+				ctx.ui.notify(
+					`🔑 keyrouter: ${providerId} strategy: ${previous} -> ${effective} ` +
+						"(applies from the next turn boundary).",
+					"info",
+				);
+				return;
+			}
 			ctx.ui.notify(`Usage: /keyrouter [${SUBCOMMANDS.join("|")}]`, "info");
 		},
 	});
@@ -1719,7 +1823,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 
 
 /** Subcommands accepted by `/keyrouter`, in usage order. */
-export const SUBCOMMANDS = ["status", "reload", "reset", "account"] as const;
+export const SUBCOMMANDS = ["status", "reload", "reset", "account", "strategy"] as const;
 
 /**
  * Parse `/keyrouter` arguments into a subcommand plus its operands.
@@ -1734,7 +1838,8 @@ export const SUBCOMMANDS = ["status", "reload", "reset", "account"] as const;
  */
 export function parseCommandArgs(args: string): {
 	sub: string;
-	/** Operands after the subcommand: [provider, entryName?] for `account`. */
+	/** Operands after the subcommand: [provider, entryName?] for `account`,
+	 * [provider, strategy?] for `strategy`. */
 	args: string[];
 	/** The exact `/keyrouter …` form to show the user for this subcommand. */
 	usage: string;
@@ -1746,7 +1851,11 @@ export function parseCommandArgs(args: string): {
 	// the unknown word was a subcommand guess, not an argument.
 	const rest = (SUBCOMMANDS as readonly string[]).includes(first) ? tokens.slice(1) : [];
 	const usage =
-		sub === "account" ? "account <provider> [name|index]" : sub;
+		sub === "account"
+			? "account <provider> [name|index]"
+			: sub === "strategy"
+				? "strategy <provider> [strategy]"
+				: sub;
 	return { sub, args: rest, usage };
 }
 
@@ -1756,6 +1865,15 @@ const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
 	reload: "re-read the config file",
 	reset: "hand providers back to pi's own credentials",
 	account: "pin a specific key or account",
+	strategy: "show or set a pool's rotation strategy",
+};
+
+/** Descriptions shown next to each strategy value in the completion menu. */
+const STRATEGY_DESCRIPTIONS: Record<string, string> = {
+	failover: "stay on the current entry until it fails",
+	"round-robin": "advance one entry at every turn boundary",
+	"stalest-first": "pick the account whose token expires soonest",
+	random: "pick a uniformly random available entry",
 };
 
 /**
@@ -1764,9 +1882,10 @@ const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
  * Pure and exported for the same reason `parseCommandArgs` is: a completion menu
  * only exists in the interactive TUI, so this is what the unit suite can drive.
  *
- * Offers the four subcommands, then — for `account` — the configured pool names,
- * then the entries of the pool already named. Suggestions carry the whole
- * command line in `value` because pi replaces the whole argument prefix, so the
+ * Offers the five subcommands, then — for `account` or `strategy` — the
+ * configured pool names, then that pool's entries (`account`) or the strategy
+ * values valid for its kind (`strategy`). Suggestions carry the whole command
+ * line in `value` because pi replaces the whole argument prefix, so the
  * earlier tokens have to be echoed back. Returns null once the line is complete,
  * which is how pi is told to stop suggesting.
  */
@@ -1796,26 +1915,46 @@ export function commandCompletions(
 		);
 	}
 
-	// Only `account` takes operands; the rest are complete on their own.
-	if (done[0]?.toLowerCase() !== "account") return null;
+	// Only `account` and `strategy` take operands; the rest are complete on
+	// their own.
+	const sub = done[0]?.toLowerCase();
+	if (sub !== "account" && sub !== "strategy") return null;
 	if (done.length > 2) return null;
 
-	// Completing the pool name.
+	// First operand, shared by both: the pool names.
 	if (done.length === 1) {
 		return items(
 			pools
 				.filter((pool) => pool.name.toLowerCase().startsWith(current))
 				.map((pool) => ({
-					value: `account ${pool.name} `,
+					value: `${sub} ${pool.name} `,
 					label: pool.name,
 					description: pool.kind === "oauth" ? "oauth pool" : "key pool",
 				})),
 		);
 	}
 
-	// Completing an entry of the pool named in `done[1]`.
+	// Second operand, once the pool is named.
 	const pool = pools.find((candidate) => candidate.name === done[1]);
 	if (!pool) return null;
+
+	if (sub === "strategy") {
+		// `stalest-first` is not offered for a keys pool: it orders by token
+		// expiry, which keys do not have, so the menu never suggests a choice
+		// that would only degrade (see `normalizeStrategy`).
+		return items(
+			[...STRATEGIES]
+				.filter((value) => !(value === "stalest-first" && pool.kind === "keys"))
+				.filter((value) => value.startsWith(current))
+				.map((value) => ({
+					value: `strategy ${pool.name} ${value}`,
+					label: value,
+					description: STRATEGY_DESCRIPTIONS[value],
+				})),
+		);
+	}
+
+	// `account`: the entries of the pool named in `done[1]`.
 	const entries = pool.kind === "oauth" ? (pool.accounts ?? []) : (pool.keys ?? []);
 	return items(
 		entries

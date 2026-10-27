@@ -381,7 +381,7 @@ check("configPath honours the override", configPath() === process.env.PI_KEYROUT
 // calls in the `account` branch are the same helpers the e2e suite exercises
 // through automatic rotation.
 // ---------------------------------------------------------------------------
-check("SUBCOMMANDS lists all four", SUBCOMMANDS.join(",") === "status,reload,reset,account");
+check("SUBCOMMANDS lists all five", SUBCOMMANDS.join(",") === "status,reload,reset,account,strategy");
 
 const bare = parseCommandArgs("");
 check("a bare /keyrouter defaults to status", bare.sub === "status" && bare.args.length === 0);
@@ -435,14 +435,14 @@ const compl = (prefix) => commandCompletions(prefix, POOLS);
 const labels = (prefix) => (compl(prefix) ?? []).map((item) => item.label);
 
 // Subcommands.
-check("an empty prefix offers every subcommand", labels("").join() === "status,reload,reset,account");
+check("an empty prefix offers every subcommand", labels("").join() === "status,reload,reset,account,strategy");
 check("a partial subcommand narrows the list", labels("re").join() === "reload,reset");
 check("subcommands are case-insensitive", labels("RE").join() === "reload,reset");
 check("a subcommand suggestion carries a trailing space", compl("st")[0].value === "status ");
 check("subcommands carry a description", /pool state/.test(compl("")[0].description ?? ""));
 check("no matching subcommand yields null", compl("zzz") === null);
 
-// After a subcommand, only `account` takes operands.
+// After a subcommand, only `account` and `strategy` take operands.
 check("a bare subcommand stops suggesting", compl("status ") === null);
 check("a chosen subcommand offers its pools", compl("account ").map((i) => i.label).join() === "cline,tokenharbor");
 check("reload takes no operands", compl("reload ") === null);
@@ -472,7 +472,7 @@ check("a null-ish prefix is safe", commandCompletions("", []).length === SUBCOMM
 // Whitespace-only still offers the subcommands: nothing has been chosen yet, and
 // offering them is harmless where offering entries for a blank pool name would
 // not be.
-check("a whitespace-only prefix still offers subcommands", labels("  ").join() === "status,reload,reset,account");
+check("a whitespace-only prefix still offers subcommands", labels("  ").join() === "status,reload,reset,account,strategy");
 check("a tab counts as a separator", compl("account\t").map((i) => i.label).join() === "cline,tokenharbor");
 check("an unknown subcommand offers nothing", compl("notacommand ") === null);
 check("an empty pool list yields null, not an empty menu", commandCompletions("account ", []) === null);
