@@ -20,6 +20,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.5.0] — 2026-10-28
+
 ### Added
 
 - **`"notifications"` config setting — `"all"` (default), `"quiet"`, or `"silent"` — tones down the
@@ -65,6 +69,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-blocking (it never touches `auth.json`, only the pool and `keyrouter.json`), and an account
   whose refresh fails is marked like a request-time refresh failure and named in one notice —
   reviving a dead login still needs an interactive `/login`.
+
 ## [1.4.0] — 2026-10-15
 
 ### Fixed
@@ -493,7 +498,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.1...v1.3.2
