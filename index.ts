@@ -34,12 +34,13 @@
 
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import {
 	loadConfig,
 	configPath,
 	writeBackCredentials,
 	writeBackActive,
+	writeBackNotifications,
 	writeBackStrategy,
 	writeBackPoolEntry,
 	uniquePoolEntryName,
@@ -90,6 +91,7 @@ import type {
 	AccountEntry,
 	KeyRouterConfig,
 	KeyState,
+	NotificationLevel,
 	OAuthCredential,
 	PoolKind,
 	ProviderConfig as ProviderPoolConfig,
@@ -2003,6 +2005,60 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
+			if (sub === "notifications") {
+				// Show or change the top-level notification level. The config is read
+				// directly here so viewing the level never activates a pool.
+				const file = configPath();
+				const fileExists = existsSync(file);
+				const requested = parsed.args[0];
+				if (!requested) {
+					// Do not cache the default when there is no file: the user may
+					// create one before the next turn, and activation should still
+					// load it normally.
+					if (!config && fileExists) config = loadConfig(ctx.cwd);
+					const current = config?.notifications ?? "all";
+					ctx.ui.notify(
+						fileExists
+							? `🔑 keyrouter: notification level: ${current} — ${NOTIFICATION_DESCRIPTIONS[current]}`
+							: `🔑 keyrouter: notification level: ${current}${config ? "" : " (default)"}; no config file found at ${file} — ${NOTIFICATION_DESCRIPTIONS[current]}`,
+						fileExists ? "info" : "warning",
+					);
+					return;
+				}
+				if (parsed.args.length !== 1 || !isNotificationLevel(requested)) {
+					// Do not echo an unknown operand: it may be something the user
+					// accidentally pasted.
+					ctx.ui.notify(
+						"🔑 keyrouter: invalid notification level. Valid values: all, quiet, silent.",
+						"warning",
+					);
+					return;
+				}
+				if (!existsSync(file)) {
+					ctx.ui.notify(
+						`🔑 keyrouter: could not set the notification level — no config file found at ${file}.`,
+						"error",
+					);
+					return;
+				}
+				if (!config) config = loadConfig(ctx.cwd);
+				const result = writeBackNotifications(requested);
+				if ("error" in result) {
+					ctx.ui.notify(
+						`🔑 keyrouter: could not save the notification level to ${file} — ${result.error}. The level was not changed.`,
+						"error",
+					);
+					return;
+				}
+				// Apply it to the live config now; waiting for /reload would leave the
+				// current session using the old notification policy.
+				config.notifications = requested;
+				ctx.ui.notify(
+					`🔑 keyrouter: notification level: ${requested}${result.updated === 0 ? " (unchanged)" : ""} — ${NOTIFICATION_DESCRIPTIONS[requested]}`,
+					"info",
+				);
+				return;
+			}
 			if (sub === "add" || sub === "remove") {
 				// Guided credential management.
 				//
@@ -2424,6 +2480,7 @@ export const SUBCOMMANDS = [
 	"strategy",
 	"add",
 	"remove",
+	"notifications",
 ] as const;
 
 /** One line of the full `/keyrouter` command help. */
@@ -2451,6 +2508,10 @@ export const COMMAND_HELP = [
 		usage: "remove <provider> <name|index>",
 		description: "remove a key or an account from a pool",
 	},
+	{
+		usage: "notifications [all|quiet|silent]",
+		description: "show or set keyrouter's notification level",
+	},
 ] as const;
 
 /** Description shown for `/keyrouter` in pi's command autocomplete. */
@@ -2458,7 +2519,8 @@ export const COMMAND_DESCRIPTION =
 	"manage credential pools — /keyrouter status [provider], /keyrouter reload, " +
 	"/keyrouter reset, /keyrouter account <provider> [name|index], " +
 	"/keyrouter strategy <provider> [strategy], /keyrouter add <provider> [name], " +
-	"/keyrouter remove <provider> <name|index]";
+	"/keyrouter remove <provider> <name|index], " +
+	"/keyrouter notifications [all|quiet|silent]";
 
 /** The full command help shown by bare `/keyrouter` and `/keyrouter --help`. */
 export function commandHelpText(): string {
@@ -2484,7 +2546,7 @@ export function parseCommandArgs(args: string): {
 	sub: string;
 	/** Operands after the subcommand: [provider?] for `status`,
 	 * [provider, entryName?] for `account`, [provider, strategy?] for `strategy`,
-	 * and [provider, entryName?] for `add`. */
+	 * [level?] for `notifications`, and [provider, entryName?] for `add`. */
 	args: string[];
 	/** The exact `/keyrouter …` form to show the user for this subcommand. */
 	usage: string;
@@ -2504,13 +2566,30 @@ export function parseCommandArgs(args: string): {
 				? "account <provider> [name|index]"
 				: sub === "strategy"
 					? "strategy <provider> [strategy]"
-					: sub === "add"
-						? "add <provider> [name]"
-						: sub === "remove"
-							? "remove <provider> <name|index>"
-							: sub;
+					: sub === "notifications"
+						? "notifications [all|quiet|silent]"
+						: sub === "add"
+							? "add <provider> [name]"
+							: sub === "remove"
+								? "remove <provider> <name|index>"
+								: sub;
 	return { sub, args: rest, usage };
 }
+
+/** The notification levels accepted by `/keyrouter notifications`. */
+const NOTIFICATION_LEVELS = ["all", "quiet", "silent"] as const satisfies readonly NotificationLevel[];
+
+/** True when a command operand is a valid notification level. */
+function isNotificationLevel(value: string): value is NotificationLevel {
+	return (NOTIFICATION_LEVELS as readonly string[]).includes(value);
+}
+
+/** Short explanations shown with the current or newly selected level. */
+const NOTIFICATION_DESCRIPTIONS: Record<NotificationLevel, string> = {
+	all: "show every keyrouter event",
+	quiet: "hide routine events; keep alerts that need action",
+	silent: "hide rotation and overload notices (pool exhaustion still notifies)",
+};
 
 /** Descriptions shown next to each subcommand in the completion menu. */
 const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
@@ -2521,6 +2600,7 @@ const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
 	strategy: "<provider> [strategy] — show or set a pool's rotation strategy",
 	add: "<provider> [name] — add/update a key or account; key input is interactive",
 	remove: "<provider> <name|index> — remove a key or an account from a pool",
+	notifications: "[all|quiet|silent] — show or set keyrouter's notification level",
 };
 
 /** Descriptions shown next to each strategy value in the completion menu. */
@@ -2537,12 +2617,12 @@ const STRATEGY_DESCRIPTIONS: Record<string, string> = {
  * Pure and exported for the same reason `parseCommandArgs` is: a completion menu
  * only exists in the interactive TUI, so this is what the unit suite can drive.
  *
- * Offers the five subcommands, then — for `account` or `strategy` — the
- * configured pool names, then that pool's entries (`account`) or the strategy
- * values valid for its kind (`strategy`). Suggestions carry the whole command
- * line in `value` because pi replaces the whole argument prefix, so the
- * earlier tokens have to be echoed back. Returns null once the line is complete,
- * which is how pi is told to stop suggesting.
+ * Offers the subcommands, then — for `account` or `strategy` — the configured
+ * pool names, then that pool's entries (`account`) or the strategy values valid
+ * for its kind (`strategy`). `notifications` offers its three level values.
+ * Suggestions carry the whole command line in `value` because pi replaces the
+ * whole argument prefix, so the earlier tokens have to be echoed back. Returns
+ * null once the line is complete, which is how pi is told to stop suggesting.
  */
 export function commandCompletions(
 	prefix: string,
@@ -2572,6 +2652,16 @@ export function commandCompletions(
 
 	// Only these take operands; the rest are complete on their own.
 	const sub = done[0]?.toLowerCase();
+	if (sub === "notifications") {
+		if (done.length > 1) return null;
+		return items(
+			NOTIFICATION_LEVELS.filter((value) => value.startsWith(current)).map((value) => ({
+				value: `notifications ${value}`,
+				label: value,
+				description: NOTIFICATION_DESCRIPTIONS[value],
+			})),
+		);
+	}
 	if (
 		sub !== "status" &&
 		sub !== "account" &&

@@ -13,7 +13,7 @@
 // TypeScript sources are loaded through Node's type-stripping, so no build step
 // is involved — same as pi's own jiti loading of the extension.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +26,7 @@ const {
 	expandEnv,
 	configPath,
 	writeBackActive,
+	writeBackNotifications,
 	writeBackPoolEntry,
 	uniquePoolEntryName,
 } = await import("../config.ts");
@@ -398,8 +399,8 @@ check("configPath honours the override", configPath() === process.env.PI_KEYROUT
 // through automatic rotation.
 // ---------------------------------------------------------------------------
 check(
-	"SUBCOMMANDS lists all seven",
-	SUBCOMMANDS.join(",") === "status,reload,reset,account,strategy,add,remove",
+	"SUBCOMMANDS lists all eight",
+	SUBCOMMANDS.join(",") === "status,reload,reset,account,strategy,add,remove,notifications",
 );
 
 const bare = parseCommandArgs("");
@@ -443,6 +444,23 @@ check(
 check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
 check("status usage shows its optional provider operand", parseCommandArgs("status").usage === "status [provider]");
 
+const notificationsCmd = parseCommandArgs("notifications");
+check("notifications parses without an operand", notificationsCmd.sub === "notifications" && notificationsCmd.args.length === 0);
+check(
+	"notifications usage lists every valid level",
+	notificationsCmd.usage === "notifications [all|quiet|silent]",
+);
+const notificationsSet = parseCommandArgs("notifications quiet");
+check(
+	"notifications parses its level operand",
+	notificationsSet.sub === "notifications" && notificationsSet.args[0] === "quiet",
+);
+check("notifications is case-insensitive", parseCommandArgs("NOTIFICATIONS silent").sub === "notifications");
+check(
+	"an invalid notifications operand reaches the command boundary unchanged",
+	parseCommandArgs("notifications loud").args[0] === "loud",
+);
+
 // add / remove: the guided credential-management commands.
 const addCmd = parseCommandArgs("add cline");
 check("add parses its provider", addCmd.sub === "add" && addCmd.args[0] === "cline");
@@ -462,9 +480,14 @@ check("help lists the add form with an optional name", helpText.includes("/keyro
 check("help does not invent a key operand", !helpText.includes("/keyrouter add <provider> [name] [key]"));
 check("help explains that key input is interactive", helpText.includes("entered interactively"));
 check(
+	"help lists the notifications operand syntax",
+	helpText.includes("/keyrouter notifications [all|quiet|silent]"),
+);
+check(
 	"the command description exposes the operand syntax",
 	COMMAND_DESCRIPTION.includes("/keyrouter status [provider]") &&
-		COMMAND_DESCRIPTION.includes("/keyrouter add <provider> [name]"),
+		COMMAND_DESCRIPTION.includes("/keyrouter add <provider> [name]") &&
+		COMMAND_DESCRIPTION.includes("/keyrouter notifications [all|quiet|silent]"),
 );
 
 check(
@@ -576,7 +599,7 @@ const labels = (prefix) => (compl(prefix) ?? []).map((item) => item.label);
 // Subcommands.
 check(
 	"an empty prefix offers every subcommand",
-	labels("").join() === "status,reload,reset,account,strategy,add,remove",
+	labels("").join() === "status,reload,reset,account,strategy,add,remove,notifications",
 );
 check("a partial subcommand narrows the list", labels("re").join() === "reload,reset,remove");
 check("subcommands are case-insensitive", labels("RE").join() === "reload,reset,remove");
@@ -590,6 +613,25 @@ check("status stops after the provider", compl("status cline ") === null);
 check("a chosen subcommand offers its pools", compl("account ").map((i) => i.label).join() === "cline,tokenharbor");
 check("reload takes no operands", compl("reload ") === null);
 check("reset takes no operands", compl("reset x") === null);
+
+// Notification levels.
+check(
+	"notifications offers all three levels",
+	compl("notifications ").map((i) => i.label).join() === "all,quiet,silent",
+);
+check(
+	"notification levels filter by prefix",
+	compl("notifications q").map((i) => i.label).join() === "quiet",
+);
+check(
+	"a notification suggestion carries the whole line",
+	compl("notifications ").find((i) => i.label === "silent").value === "notifications silent",
+);
+check(
+	"notification suggestions explain their level",
+	/notices/.test(compl("notifications ").find((i) => i.label === "silent").description ?? ""),
+);
+check("notifications stops after its level", compl("notifications quiet ") === null);
 
 // Pool names.
 check("pool names filter by prefix", compl("account to").map((i) => i.label).join() === "tokenharbor");
@@ -643,7 +685,7 @@ check("a null-ish prefix is safe", commandCompletions("", []).length === SUBCOMM
 // not be.
 check(
 	"a whitespace-only prefix still offers subcommands",
-	labels("  ").join() === "status,reload,reset,account,strategy,add,remove",
+	labels("  ").join() === "status,reload,reset,account,strategy,add,remove,notifications",
 );
 check("a tab counts as a separator", compl("account\t").map((i) => i.label).join() === "cline,tokenharbor");
 check("an unknown subcommand offers nothing", compl("notacommand ") === null);
@@ -774,6 +816,77 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	active = JSON.parse(readFileSync(persistFile, "utf8"));
 	check("clearing leaves no active field", active.providers[0].active === undefined);
 	check("clearing an already-unset active is a no-op", writeBackActive("cline", undefined).updated === 0);
+
+	// --- notifications: the top-level status-line volume ----------------
+	const notificationFile = join(persistDir, "notifications.json");
+	const notificationSeed = {
+		providers: [{ name: "google", keys: [{ name: "primary", value: "$GOOGLE_KEY" }] }],
+		notifications: "all",
+		maxRetries: 3,
+		_customTopLevelField: { keep: true },
+	};
+	writeFileSync(notificationFile, JSON.stringify(notificationSeed, null, 2) + "\n", "utf8");
+	process.env.PI_KEYROUTER_CONFIG = notificationFile;
+
+	const setNotifications = writeBackNotifications("quiet");
+	check("writeBackNotifications reports one update", setNotifications.updated === 1);
+	const quietText = readFileSync(notificationFile, "utf8");
+	const quietConfig = JSON.parse(quietText);
+	check("write-back sets the notification level", quietConfig.notifications === "quiet");
+	check(
+		"write-back preserves every other top-level field",
+		quietConfig.maxRetries === 3 &&
+			quietConfig._customTopLevelField.keep === true &&
+			JSON.stringify(quietConfig.providers) === JSON.stringify(notificationSeed.providers),
+	);
+	check(
+		"write-back preserves key order and formatting",
+		Object.keys(quietConfig).join() === Object.keys(notificationSeed).join() &&
+			quietText === JSON.stringify({ ...notificationSeed, notifications: "quiet" }, null, 2) + "\n",
+	);
+	check("an unchanged notification level is a no-op", writeBackNotifications("quiet").updated === 0);
+	check("a no-op notification write does not rewrite the file", readFileSync(notificationFile, "utf8") === quietText);
+	check("write-back can change the notification level", writeBackNotifications("silent").updated === 1);
+	check("the changed notification level is persisted", JSON.parse(readFileSync(notificationFile, "utf8")).notifications === "silent");
+
+	const missingNotificationsFile = join(persistDir, "missing-notifications.json");
+	process.env.PI_KEYROUTER_CONFIG = missingNotificationsFile;
+	const missingNotifications = writeBackNotifications("quiet");
+	check(
+		"a missing config is reported as a write-back error",
+		"error" in missingNotifications && /cannot read/.test(missingNotifications.error),
+	);
+	check("a missing config is not created", !existsSync(missingNotificationsFile));
+
+	const malformedNotificationsFile = join(persistDir, "malformed-notifications.json");
+	writeFileSync(malformedNotificationsFile, '{"privateValue":"must-not-appear"', "utf8");
+	process.env.PI_KEYROUTER_CONFIG = malformedNotificationsFile;
+	const malformedNotifications = writeBackNotifications("quiet");
+	check(
+		"malformed JSON is reported as a write-back error",
+		"error" in malformedNotifications && /cannot parse/.test(malformedNotifications.error),
+	);
+	check(
+		"a malformed-config error never quotes file contents",
+		!("error" in malformedNotifications) || !malformedNotifications.error.includes("must-not-appear"),
+	);
+
+	const failedNotificationsFile = join(persistDir, "failed-notifications.json");
+	writeFileSync(failedNotificationsFile, JSON.stringify(notificationSeed, null, 2) + "\n", "utf8");
+	const failedTemp = `${failedNotificationsFile}.keyrouter.tmp`;
+	mkdirSync(failedTemp);
+	process.env.PI_KEYROUTER_CONFIG = failedNotificationsFile;
+	const failedNotifications = writeBackNotifications("quiet");
+	check(
+		"a failed atomic write is reported as an error",
+		"error" in failedNotifications && /cannot write/.test(failedNotifications.error),
+	);
+	check(
+		"a failed atomic write leaves the original config unchanged",
+		readFileSync(failedNotificationsFile, "utf8") === JSON.stringify(notificationSeed, null, 2) + "\n",
+	);
+	rmSync(failedTemp, { recursive: true, force: true });
+	process.env.PI_KEYROUTER_CONFIG = persistFile;
 
 	// --- pool entries: what the guided add/remove commands write ---------
 	const addedKey = writeBackPoolEntry("google", "add", { name: "k2", value: "sk-2" });

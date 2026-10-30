@@ -425,6 +425,59 @@ export function writeBackStrategy(
 	return { updated };
 }
 
+/**
+ * Write the top-level `notifications` level back into `keyrouter.json`.
+ *
+ * Same safety rules as the other write-backs: only this one field changes,
+ * the rest of the file keeps its order and 2-space formatting, the write is
+ * atomic, it is skipped when nothing moved, and a failure is reported rather
+ * than thrown.
+ *
+ * @returns 1 when the level changed, 0 when it was already current
+ */
+export function writeBackNotifications(
+	level: NotificationLevel,
+	home?: string,
+): { updated: number } | { error: string } {
+	const file = configPath(undefined, home);
+	let rawText: string;
+	try {
+		rawText = fs.readFileSync(file, "utf-8");
+	} catch (error) {
+		return { error: `cannot read ${file}: ${(error as Error).message}` };
+	}
+
+	let parsed: Record<string, unknown>;
+	try {
+		const value: unknown = JSON.parse(rawText);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			return { error: `${file} is not a JSON object` };
+		}
+		parsed = value as Record<string, unknown>;
+	} catch {
+		// Do not include the parser's message: it may quote part of the file,
+		// which can contain credentials.
+		return { error: `cannot parse ${file} as JSON` };
+	}
+
+	if (parsed.notifications === level) return { updated: 0 };
+	parsed.notifications = level;
+
+	const temp = `${file}.keyrouter.tmp`;
+	try {
+		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(temp, file);
+	} catch (error) {
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			// best effort cleanup
+		}
+		return { error: `cannot write ${file}: ${(error as Error).message}` };
+	}
+	return { updated: 1 };
+}
+
 type ExternalPoolReference =
 	| { kind: "environment"; target: string }
 	| { kind: "file"; target: string };
