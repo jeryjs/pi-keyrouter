@@ -549,6 +549,24 @@ const cases = [
 		],
 	},
 	{
+		name: "leased-entry-is-skipped",
+		config: "abc",
+		// Another live process holds the FIRST entry of the pool: this run must
+		// start on the next one instead of piling onto the same credential.
+		before: () => {
+			const leaseDir = join(PI_HOME, "keyrouter-leases");
+			mkdirSync(leaseDir, { recursive: true });
+			writeFileSync(join(leaseDir, "krtest.0.lease"), `${process.ppid}\n`, "utf8");
+		},
+		plan: { default: "ok", text: "PONG" },
+		expect: ({ keys, trace, pi }) => [
+			["pi printed PONG", pi.code === 0 && /PONG/.test(pi.stdout)],
+			["exactly one request", keys.length === 1],
+			["it used sk-b (the leased entry was skipped)", keys[0] === "sk-b", keys.join(",")],
+			["trace: bootstrap krtest -> B", traceHas(trace, "bootstrap krtest -> B")],
+		],
+	},
+	{
 		name: "stale-active-falls-back-to-first",
 		config: "abc-stale-active",
 		plan: { default: "ok", text: "PONG" },
@@ -744,6 +762,10 @@ function lastRotateAfterLastContinue(trace) {
 async function prepareFixture() {
 	mkdirSync(AGENT_DIR, { recursive: true });
 	mkdirSync(PI_HOME, { recursive: true });
+	// The credential leases live next to the config file, so they land here.
+	// Start from an empty directory: a claim left by a previous run belongs to
+	// a process that no longer exists and would only be stale noise.
+	rmSync(join(PI_HOME, "keyrouter-leases"), { recursive: true, force: true });
 	const modelsPath = join(AGENT_DIR, "models.json");
 	const fixture = {
 		providers: {
@@ -820,6 +842,11 @@ async function main() {
 	const results = [];
 	for (const c of selected) {
 		writeConfig(c.config);
+		// The credential leases live next to the config file, so they land in the
+		// fixture. Every case starts without any: a claim left by the previous
+		// run belongs to a process that no longer exists.
+		rmSync(join(PI_HOME, "keyrouter-leases"), { recursive: true, force: true });
+		if (c.before) await c.before();
 		if (existsSync(TRACE)) rmSync(TRACE);
 		await admin("/__admin/reset");
 		await admin("/__admin/plan", c.plan);

@@ -96,6 +96,19 @@ export function recordUse(state: KeyState): void {
 }
 
 /**
+ * True when an entry is currently held by an in-flight provider request.
+ *
+ * A lease is a reservation, not a lock: it records that some request is using
+ * this entry RIGHT NOW. Selection prefers unleased entries so keyrouter never
+ * walks onto a key that another request is already using, but a lease never
+ * blocks a rotation outright — when every entry is leased, the busy one is
+ * reused rather than leaving the request with no credential at all.
+ */
+function isLeased(index: number, leased?: ReadonlySet<number>): boolean {
+  return leased !== undefined && leased.has(index);
+}
+
+/**
  * Pick the next key to try.
  *
  * Priority:
@@ -111,22 +124,28 @@ export function pickNextKey(
   states: KeyState[],
   preferredIndex: number,
   now: number,
+  leased?: ReadonlySet<number>,
 ): number {
   if (states.length === 0) return -1;
 
-  // 1. Preferred if available
-  const preferred = states[preferredIndex];
-  if (preferred && isAvailable(preferred, now)) {
-    return preferredIndex;
-  }
-
-  // 2. Next available in rotation order (start from preferred + 1)
+  // Preference order: the preferred entry first, then the rest in cycle order.
+  const order: number[] = [];
+  if (preferredIndex >= 0 && preferredIndex < states.length) order.push(preferredIndex);
   for (let offset = 1; offset <= states.length; offset++) {
     const idx = (preferredIndex + offset) % states.length;
+    if (!order.includes(idx)) order.push(idx);
+  }
+
+  // 1. The first available entry that no in-flight request is holding.
+  for (const idx of order) {
     const s = states[idx];
-    if (s && isAvailable(s, now)) {
-      return idx;
-    }
+    if (s && isAvailable(s, now) && !isLeased(idx, leased)) return idx;
+  }
+  // 2. Every available entry is leased. A lease is a PREFERENCE, never a
+  //    deadlock: reusing a busy entry beats refusing to rotate at all.
+  for (const idx of order) {
+    const s = states[idx];
+    if (s && isAvailable(s, now)) return idx;
   }
 
   // 3. All on cooldown or in overload — pick the one that becomes
@@ -191,6 +210,7 @@ export function pickStrategyNext(
   currentIndex: number,
   strategy: RotationStrategy,
   now: number,
+  leased?: ReadonlySet<number>,
 ): number {
   if (states.length === 0) return -1;
   // Modulo, never a bare `currentIndex + 1`: `pickNextKey` treats its
@@ -202,39 +222,61 @@ export function pickStrategyNext(
   // `currentIndex + 1` is unaffected: the entry being left is on cooldown, so
   // the scan's early return of it can never happen.)
   if (strategy === "round-robin")
-    return pickNextKey(states, (currentIndex + 1) % states.length, now);
-  if (strategy === "stalest-first") return pickStalest(states, now);
-  return pickRandom(states, currentIndex, now);
+    return pickNextKey(states, (currentIndex + 1) % states.length, now, leased);
+  if (strategy === "stalest-first") return pickStalest(states, now, leased);
+  return pickRandom(states, currentIndex, now, leased);
 }
 
-function pickStalest(states: KeyState[], now: number): number {
-  let bestIdx = -1;
-  let bestExpires = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < states.length; i++) {
-    const s = states[i];
-    if (!s || !isAvailable(s, now)) continue;
-    const expires = s.credential?.expires;
-    if (typeof expires !== "number") continue;
-    if (expires < bestExpires) {
-      bestExpires = expires;
-      bestIdx = i;
+function pickStalest(states: KeyState[], now: number, leased?: ReadonlySet<number>): number {
+  const stalest = (skipLeased: boolean): number => {
+    let bestIdx = -1;
+    let bestExpires = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < states.length; i++) {
+      const s = states[i];
+      if (!s || !isAvailable(s, now)) continue;
+      if (skipLeased && isLeased(i, leased)) continue;
+      const expires = s.credential?.expires;
+      if (typeof expires !== "number") continue;
+      if (expires < bestExpires) {
+        bestExpires = expires;
+        bestIdx = i;
+      }
     }
-  }
-  if (bestIdx >= 0) return bestIdx;
+    return bestIdx;
+  };
+  const free = stalest(true);
+  if (free >= 0) return free;
+  // Every candidate is leased: a lease is a preference, never a deadlock.
+  const busy = stalest(false);
+  if (busy >= 0) return busy;
   // No entry carries an expiry (all credentials absent — normalize drops those,
   // so this is defensive): behave like round-robin so the strategy still spreads.
-  return pickNextKey(states, 0, now);
+  return pickNextKey(states, 0, now, leased);
 }
 
-function pickRandom(states: KeyState[], currentIndex: number, now: number): number {
-  const candidates: number[] = [];
-  for (let i = 0; i < states.length; i++) {
-    if (i === currentIndex) continue;
-    const s = states[i];
-    if (s && isAvailable(s, now)) candidates.push(i);
-  }
-  if (candidates.length === 0) return currentIndex;
-  return candidates[Math.floor(Math.random() * candidates.length)] ?? currentIndex;
+function pickRandom(
+  states: KeyState[],
+  currentIndex: number,
+  now: number,
+  leased?: ReadonlySet<number>,
+): number {
+  const collect = (skipLeased: boolean): number[] => {
+    const candidates: number[] = [];
+    for (let i = 0; i < states.length; i++) {
+      if (i === currentIndex) continue;
+      const s = states[i];
+      if (!s || !isAvailable(s, now)) continue;
+      if (skipLeased && isLeased(i, leased)) continue;
+      candidates.push(i);
+    }
+    return candidates;
+  };
+  const free = collect(true);
+  if (free.length > 0) return free[Math.floor(Math.random() * free.length)] ?? currentIndex;
+  // Every candidate is leased: a lease is a preference, never a deadlock.
+  const busy = collect(false);
+  if (busy.length > 0) return busy[Math.floor(Math.random() * busy.length)] ?? currentIndex;
+  return currentIndex;
 }
 
 /**

@@ -13,14 +13,21 @@
 // TypeScript sources are loaded through Node's type-stripping, so no build step
 // is involved — same as pi's own jiti loading of the extension.
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const { credentialStore, isOAuthCredential, installCredential, captureCredential, clearOverlay, hasStoredOAuthLogin } =
 	await import("../oauth.ts");
-const { parseAccountCredential, validateCredential, loadConfig, expandEnv, configPath, writeBackActive } =
-	await import("../config.ts");
+const {
+	parseAccountCredential,
+	validateCredential,
+	loadConfig,
+	expandEnv,
+	configPath,
+	writeBackActive,
+	writeBackPoolEntry,
+} = await import("../config.ts");
 const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = await import("../rotation.ts");
 const {
 	notifyRotation,
@@ -381,7 +388,10 @@ check("configPath honours the override", configPath() === process.env.PI_KEYROUT
 // calls in the `account` branch are the same helpers the e2e suite exercises
 // through automatic rotation.
 // ---------------------------------------------------------------------------
-check("SUBCOMMANDS lists all five", SUBCOMMANDS.join(",") === "status,reload,reset,account,strategy");
+check(
+	"SUBCOMMANDS lists all seven",
+	SUBCOMMANDS.join(",") === "status,reload,reset,account,strategy,add,remove",
+);
 
 const bare = parseCommandArgs("");
 check("a bare /keyrouter defaults to status", bare.sub === "status" && bare.args.length === 0);
@@ -415,6 +425,19 @@ check(
 check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
 check("status takes no operands, usage is just the subcommand", parseCommandArgs("status").usage === "status");
 
+// add / remove: the guided credential-management commands.
+const addCmd = parseCommandArgs("add cline");
+check("add parses its provider", addCmd.sub === "add" && addCmd.args[0] === "cline");
+check("add with no name has just one operand", addCmd.args.length === 1);
+check("add usage is self-describing", /add <provider>/.test(addCmd.usage));
+check("add accepts a name", parseCommandArgs("add cline work").args[1] === "work");
+check("add is case-insensitive", parseCommandArgs("ADD cline").sub === "add");
+const removeCmd = parseCommandArgs("remove cline work");
+check("remove parses provider + name", removeCmd.sub === "remove" && removeCmd.args[1] === "work");
+check("remove accepts an ordinal", parseCommandArgs("remove cline 2").args[1] === "2");
+check("remove usage is self-describing", /remove <provider>/.test(removeCmd.usage));
+check("remove is case-insensitive", parseCommandArgs("REMOVE cline").sub === "remove");
+
 // ---------------------------------------------------------------------------
 // 10. commandCompletions — the /keyrouter completion menu
 //
@@ -435,9 +458,12 @@ const compl = (prefix) => commandCompletions(prefix, POOLS);
 const labels = (prefix) => (compl(prefix) ?? []).map((item) => item.label);
 
 // Subcommands.
-check("an empty prefix offers every subcommand", labels("").join() === "status,reload,reset,account,strategy");
-check("a partial subcommand narrows the list", labels("re").join() === "reload,reset");
-check("subcommands are case-insensitive", labels("RE").join() === "reload,reset");
+check(
+	"an empty prefix offers every subcommand",
+	labels("").join() === "status,reload,reset,account,strategy,add,remove",
+);
+check("a partial subcommand narrows the list", labels("re").join() === "reload,reset,remove");
+check("subcommands are case-insensitive", labels("RE").join() === "reload,reset,remove");
 check("a subcommand suggestion carries a trailing space", compl("st")[0].value === "status ");
 check("subcommands carry a description", /pool state/.test(compl("")[0].description ?? ""));
 check("no matching subcommand yields null", compl("zzz") === null);
@@ -456,6 +482,16 @@ check("pools are labelled by kind", compl("account ").map((i) => i.description).
 check("an unknown pool yields null", compl("account nope") === null);
 
 // Entries, for either pool kind.
+check("add offers the pool names", compl("add ").map((i) => i.label).join() === "cline,tokenharbor");
+check("add stops after the pool (the new name is free-form)", compl("add cline ") === null);
+check(
+	"remove offers the pool's entries",
+	compl("remove cline ").map((i) => i.label).join() === "work,home,work-laptop",
+);
+check(
+	"a remove suggestion carries the whole line",
+	compl("remove cline wo").find((i) => i.label === "work").value === "remove cline work",
+);
 check("entries of an oauth pool", compl("account cline ").map((i) => i.label).join() === "work,home,work-laptop");
 check("entries of a keys pool", compl("account tokenharbor ").map((i) => i.label).join() === "primary,backup");
 check("entries filter by prefix", compl("account cline wo").map((i) => i.label).join() === "work,work-laptop");
@@ -472,7 +508,10 @@ check("a null-ish prefix is safe", commandCompletions("", []).length === SUBCOMM
 // Whitespace-only still offers the subcommands: nothing has been chosen yet, and
 // offering them is harmless where offering entries for a blank pool name would
 // not be.
-check("a whitespace-only prefix still offers subcommands", labels("  ").join() === "status,reload,reset,account,strategy");
+check(
+	"a whitespace-only prefix still offers subcommands",
+	labels("  ").join() === "status,reload,reset,account,strategy,add,remove",
+);
 check("a tab counts as a separator", compl("account\t").map((i) => i.label).join() === "cline,tokenharbor");
 check("an unknown subcommand offers nothing", compl("notacommand ") === null);
 check("an empty pool list yields null, not an empty menu", commandCompletions("account ", []) === null);
@@ -601,10 +640,109 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	check("clearing leaves no active field", active.providers[0].active === undefined);
 	check("clearing an already-unset active is a no-op", writeBackActive("cline", undefined).updated === 0);
 
+	// --- pool entries: what the guided add/remove commands write ---------
+	const addedKey = writeBackPoolEntry("google", "add", { name: "k2", value: "sk-2" });
+	check("writeBackPoolEntry reports one update", addedKey.updated === 1);
+	let pool = JSON.parse(readFileSync(persistFile, "utf8"));
+	check(
+		"the key entry is appended",
+		pool.providers[1].keys[1].name === "k2" && pool.providers[1].keys[1].value === "sk-2",
+	);
+	check(
+		"a duplicate name is a no-op",
+		writeBackPoolEntry("google", "add", { name: "k2", value: "sk-3" }).updated === 0,
+	);
+	check(
+		"an unknown pool is a no-op",
+		writeBackPoolEntry("ghost", "add", { name: "x", value: "y" }).updated === 0,
+	);
+	check(
+		"the other pools are untouched",
+		JSON.parse(readFileSync(persistFile, "utf8")).providers[0].accounts.length === 2,
+	);
+
+	const addedAccount = writeBackPoolEntry("cline", "add", {
+		name: "a3",
+		credential: { type: "oauth", access: "new-access", refresh: "refresh-3", expires: 3000 },
+	});
+	check("an account pool accepts an entry", addedAccount.updated === 1);
+	pool = JSON.parse(readFileSync(persistFile, "utf8"));
+	check(
+		"the account entry keeps its credential",
+		pool.providers[0].accounts[2].name === "a3" && pool.providers[0].accounts[2].credential.access === "new-access",
+	);
+
+	writeBackActive("google", "k2");
+	check("the entry is removed", writeBackPoolEntry("google", "remove", { name: "k2" }).updated === 1);
+	pool = JSON.parse(readFileSync(persistFile, "utf8"));
+	check("the removal took effect", pool.providers[1].keys.length === 1);
+	check("removing the active entry forgets the position", pool.providers[1].active === undefined);
+	check(
+		"removing an unknown entry is a no-op",
+		writeBackPoolEntry("google", "remove", { name: "nope" }).updated === 0,
+	);
+
 	delete process.env.PI_KEYROUTER_CONFIG;
 	} finally {
 		rmSync(persistDir, { recursive: true, force: true });
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. Leases — an exclusive claim on one pool entry
+//
+// A lease is how two pi processes sharing a pool stay off each other's
+// credential: the claim is a file, created exclusively, and another live
+// process holding it makes the entry un-pickable. The selection half lives in
+// rotation.ts and stays pure, so it is tested here as a plain argument.
+// ---------------------------------------------------------------------------
+const leaseHome = mkdtempSync(join(tmpdir(), "kr-unit-lease-"));
+try {
+	const { claimLease, releaseLease, leasedByOthers, leaseOwner } = await import("../lease.ts");
+	// The leases live next to the config file, so a test points them at a
+	// throwaway config rather than at the user's own ~/.pi.
+	const leaseConfig = join(leaseHome, "keyrouter.json");
+	const leaseDir = join(leaseHome, "keyrouter-leases");
+
+	check("a fresh entry is free", leaseOwner("p", 0, leaseConfig) === undefined);
+	check("claiming succeeds", claimLease("p", 0, leaseConfig) === true);
+	check("the claim is ours", leaseOwner("p", 0, leaseConfig) === process.pid);
+	check("claiming twice is still ours", claimLease("p", 0, leaseConfig) === true);
+	check("our own claim is not another process", !leasedByOthers("p", 3, leaseConfig).has(0));
+	releaseLease("p", 0, leaseConfig);
+	check("releasing frees the entry", leaseOwner("p", 0, leaseConfig) === undefined);
+
+	// Another LIVE process holds the entry: it must be invisible to us to take,
+	// and visible to the picker.
+	mkdirSync(leaseDir, { recursive: true });
+	writeFileSync(join(leaseDir, "p.1.lease"), `${process.ppid}\n`, "utf8");
+	check("another live process holds the entry", leasedByOthers("p", 3, leaseConfig).has(1));
+	check("a held entry cannot be claimed", claimLease("p", 1, leaseConfig) === false);
+	check("releasing never steals somebody else's claim", (releaseLease("p", 1, leaseConfig), leaseOwner("p", 1, leaseConfig) === process.ppid));
+
+	// A DEAD process's claim is stale and may be taken over.
+	writeFileSync(join(leaseDir, "p.2.lease"), "999999999\n", "utf8");
+	check("a dead owner's claim is stale", !leasedByOthers("p", 3, leaseConfig).has(2));
+	check("a stale claim can be taken over", claimLease("p", 2, leaseConfig) === true);
+	check("the taken-over claim is ours", leaseOwner("p", 2, leaseConfig) === process.pid);
+
+	// The selection half: a leased entry is skipped, but a lease never
+	// deadlocks the picker.
+	const leasedStates = initKeyStates([
+		{ name: "a", value: "1" },
+		{ name: "b", value: "2" },
+	]);
+	check("a leased entry is skipped", pickNextKey(leasedStates, 0, Date.now(), new Set([0])) === 1);
+	check(
+		"a lease never deadlocks the picker",
+		pickNextKey(leasedStates, 0, Date.now(), new Set([0, 1])) === 0,
+	);
+	check(
+		"without leases the preferred entry still wins",
+		pickNextKey(leasedStates, 0, Date.now()) === 0,
+	);
+} finally {
+	rmSync(leaseHome, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? "\nall oauth unit tests pass" : `\n${failures} unit test(s) failed`);

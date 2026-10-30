@@ -85,6 +85,7 @@ test/fixture/agent/models.json
 test/fixture/agent/models-store.json
 test/fixture/agent/settings.json
 test/fixture/pi-home/keyrouter.json
+test/fixture/pi-home/keyrouter-leases/
 
 # ---------------------------------------------------------------------------
 # Credential-sync watcher (instrumentation, not part of the extension)

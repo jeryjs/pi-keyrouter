@@ -189,6 +189,43 @@ Only the name is written — never a key value or a token. The write is atomic, 
 position is unchanged, and `/keyrouter reset` deletes the field so the next session genuinely starts
 fresh.
 
+### Leases — one credential per concurrent worker
+
+A pool is shared by every pi process on the machine: a subagent, a second window, a `pi` running in
+another directory. Left alone they all install the same first entry and then hit the same 429 at
+the same time. A **lease** is the coordination: an exclusive claim on one entry of a pool.
+
+The claim is a file under `~/.pi/keyrouter-leases/`, created with an exclusive create, so the
+filesystem — not a lock protocol — decides the winner. The first process to install an entry holds
+the claim; another process sees it and picks a different entry. The claim is released when the
+entry is replaced, when the pools are handed back (`reset`, `reload`), and at shutdown. A claim
+whose owner process is gone is stale and is taken over.
+
+Within one process, a request holds its entry for the duration of that request, so a rotation never
+walks onto a credential that is already serving one. A lease is a **preference, never a lock**: when
+every entry is leased, the busy one is reused rather than leaving the request with no credential at
+all.
+
+`/keyrouter status` shows who holds each entry:
+
+```
+tokenharbor (keys, active: primary, installed: yes, source: runtime)
+  → primary  uses=4 fails=0 status=ok lease=this-session
+    backup   uses=2 fails=0 status=ok lease=pid 48213
+    spare    uses=0 fails=0 status=ok
+```
+
+A manual `/keyrouter account` pin overrides the lease: you asked for that credential explicitly,
+so the pool installs it even when another process holds the claim.
+
+**OAuth pools do not use leases.** pi's credential store holds exactly one credential per provider
+id — `~/.pi/agent/auth.json` is `{ [providerId]: credential }` — and every process reads the same
+file, so two processes cannot hold two different accounts for one provider: there is no slot to
+lease. Spreading OAuth accounts across concurrent processes needs a distinct provider id per
+account, which is the architecture keyrouter deliberately does not use (it never registers
+providers). Run those processes against different provider ids, or give them separate agent homes,
+when they need different accounts.
+
 ---
 
 ## OAuth
@@ -392,14 +429,16 @@ error, rather than leaving you logged out.
 /keyrouter reset      hand providers back to pi's own credentials immediately
 /keyrouter account <provider> [name|index]    pin a specific key or account
 /keyrouter strategy <provider> [strategy]    show or set a pool's rotation strategy
+/keyrouter add <provider> [name]    add a key or an account to a pool
+/keyrouter remove <provider> <name|index>    remove a key or an account from a pool
 ```
 
 `reset` also clears each pool's saved `active` position, so the next session starts at the first
 entry rather than resuming onto the credential you just handed back.
 
-The completion menu fills the rest in: the five subcommands first, then the configured pools after `account` or
-`strategy`, then that pool's entries for `account`, or the strategy values valid for that pool's
-kind for `strategy`. Entry names are matched case-insensitively, and the pool's
+The completion menu fills the rest in: the subcommands first, then the configured pools after
+`account`, `strategy`, `add` or `remove`, then that pool's entries for `account` and `remove`, or
+the strategy values valid for that pool's kind for `strategy`. Entry names are matched case-insensitively, and the pool's
 current `active` entry is labelled as such. Suggestions stop as soon as the command is complete, so
 `status` and `reload` never offer operands.
 
@@ -440,6 +479,27 @@ from the file (absent already means failover). On a `keys` pool, `stalest-first`
 offered: it orders by token expiry, which keys do not have, so it degrades to `round-robin` with a
 warning — the command stores the effective value so a later reload does not warn again. A strategy
 other than `failover` also shows up in `/keyrouter status` next to the pool's `source`.
+
+`add` and `remove` manage a pool's entries without hand-editing the file:
+
+```
+/keyrouter add tokenharbor backup      → prompts for the key, then:
+                                         added backup to tokenharbor. It joins the pool on the next turn.
+/keyrouter add tokenharbor              → the name defaults to key-3
+/keyrouter add cline                   → captures the account pi is holding (run /login first)
+/keyrouter remove tokenharbor backup    → confirms, then:
+                                         removed backup from tokenharbor.
+```
+
+`add` asks for an API key in a prompt and writes it to `~/.pi/keyrouter.json` — keyrouter never
+runs a login of its own. (pi's prompt is a plain text field, not a masked one, so the key is
+visible while you type it.) For an `accounts` pool it captures the credential **pi** is holding right
+now, so the flow stays pi's own: `/login` first, then `/keyrouter add <provider>`. If pi is already
+holding one of the pool's accounts, the command says so rather than adding the same credential
+twice.
+
+`remove` deletes the entry from the file after a confirmation, and forgets the pool's `active`
+position when that was the entry removed. pi's own login is never touched.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and

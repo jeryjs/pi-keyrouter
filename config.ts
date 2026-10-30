@@ -425,6 +425,86 @@ export function writeBackStrategy(
 	return { updated };
 }
 
+/**
+ * Add or remove ONE entry of a pool, in place.
+ *
+ * This is what the guided `/keyrouter add` and `/keyrouter remove` commands
+ * write through. Same safety rules as the other write-backs: only the pool's
+ * own entry list changes, the rest of the file keeps its order and formatting,
+ * the write is atomic, it is skipped when nothing changed, and a failure is
+ * reported rather than thrown.
+ *
+ * The entry is written in the form the pool already uses: a `keys` pool gets
+ * `{name, value}`, an `accounts` pool gets `{name, credential}`. A pool with
+ * neither list is left alone — a command does not invent a pool that the
+ * config file does not have.
+ *
+ * @returns the number of pools updated (0 when there was nothing to do)
+ */
+export function writeBackPoolEntry(
+	providerName: string,
+	action: "add" | "remove",
+	entry: { name: string; value?: string; credential?: OAuthCredential },
+	home?: string,
+): { updated: number } | { error: string } {
+	const file = configPath(undefined, home);
+	let rawText: string;
+	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
+	try {
+		rawText = fs.readFileSync(file, "utf-8");
+		parsed = JSON.parse(rawText) as typeof parsed;
+	} catch (error) {
+		return { error: `cannot read ${file}: ${(error as Error).message}` };
+	}
+
+	let updated = 0;
+	for (const provider of parsed.providers ?? []) {
+		if (provider?.name !== providerName) continue;
+		const keys = Array.isArray(provider.keys)
+			? (provider.keys as Array<Record<string, unknown>>)
+			: undefined;
+		const accounts = Array.isArray(provider.accounts)
+			? (provider.accounts as Array<Record<string, unknown>>)
+			: undefined;
+		const list = keys ?? accounts;
+		if (!list) continue;
+
+		if (action === "add") {
+			if (list.some((item) => item?.name === entry.name)) continue;
+			if (keys) {
+				if (typeof entry.value !== "string") continue;
+				list.push({ name: entry.name, value: entry.value });
+			} else {
+				if (!entry.credential) continue;
+				list.push({ name: entry.name, credential: entry.credential });
+			}
+		} else {
+			const index = list.findIndex((item) => item?.name === entry.name);
+			if (index < 0) continue;
+			list.splice(index, 1);
+			// The saved position may have pointed at the entry that just went away:
+			// forget it rather than leave a name that resolves to nothing.
+			if (provider.active === entry.name) delete provider.active;
+		}
+		updated += 1;
+	}
+	if (updated === 0) return { updated: 0 };
+
+	const temp = `${file}.keyrouter.tmp`;
+	try {
+		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(temp, file);
+	} catch (error) {
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			// best effort cleanup
+		}
+		return { error: `cannot write ${file}: ${(error as Error).message}` };
+	}
+	return { updated };
+}
+
 export function defaultConfig(): KeyRouterConfig {
 	return {
 		providers: [],

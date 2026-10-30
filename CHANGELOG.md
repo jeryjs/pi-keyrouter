@@ -20,7 +20,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+## [1.6.0] — 2026-10-30
+
+### Added
+
+- **Credential leases: concurrent pi processes no longer pile onto the same credential.** A lease is
+  an exclusive claim on one entry of a pool. The claim is a file under `~/.pi/keyrouter-leases/`,
+  created with an exclusive create, so the filesystem — not a lock protocol — decides the winner:
+  the first process to install an entry holds the claim, and another process sees it and picks a
+  different entry instead. The claim is released when the entry is replaced, when the pools are
+  handed back (`reset`, `reload`), and at shutdown; a claim whose owner process is gone is stale
+  and is taken over. Within one process a request holds its entry for the duration of that
+  request, so a rotation never walks onto a credential that is already serving one — and a lease is
+  a preference, never a lock, so an all-leased pool still rotates rather than failing the request.
+  `/keyrouter status` shows the holder of every entry (`this-session`, another process's pid, or
+  `in-flight`). Leases apply to API-key pools only: pi's OAuth store holds one credential per
+  provider id, shared by every process, so there is no slot to lease there.
+
+- **`/keyrouter add <provider> [name]` and `/keyrouter remove <provider> <name|index>` manage a
+  pool's entries without hand-editing `~/.pi/keyrouter.json`.** `add` asks for an API key in a
+  prompt and writes it to the file — keyrouter never runs a login of its own. For an `accounts`
+  pool it captures the credential pi is holding right now, so the flow stays pi's own: `/login`
+  first, then `/keyrouter add <provider>`; when pi is already holding one of the pool's accounts
+  the command says so instead of adding the same credential twice. `remove` confirms, deletes the
+  entry, and forgets the pool's `active` position when that was the entry removed. Both write
+  through the same in-place, atomic writer the other write-backs use, and the completion menu
+  offers the pools and their entries.
 
 ## [1.5.0] — 2026-10-28
 
@@ -498,7 +523,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.2...v1.3.3

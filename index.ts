@@ -41,6 +41,7 @@ import {
 	writeBackCredentials,
 	writeBackActive,
 	writeBackStrategy,
+	writeBackPoolEntry,
 	normalizeStrategy,
 	STRATEGIES,
 } from "./config.ts";
@@ -67,6 +68,13 @@ import {
 	resolveUserPath,
 } from "./identity.ts";
 import {
+	claimLease,
+	leaseOwner,
+	leasedByOthers,
+	releaseLease,
+	releaseOwnLeases,
+} from "./lease.ts";
+import {
 	initAccountStates,
 	initKeyStates,
 	isAvailable,
@@ -80,6 +88,7 @@ import {
 import type {
 	KeyRouterConfig,
 	KeyState,
+	OAuthCredential,
 	PoolKind,
 	ProviderConfig as ProviderPoolConfig,
 	RotationEvent,
@@ -234,6 +243,25 @@ interface ProviderRuntime {
 	 * Reset by any non-error assistant response.
 	 */
 	continuations: number;
+	/**
+	 * The pool entry this process holds a lease on (-1 = none).
+	 *
+	 * A lease is an exclusive claim on one entry, visible to other pi processes
+	 * through the lease directory, so two processes sharing a pool do not pile
+	 * onto the same credential. Only API-key pools use it: pi's OAuth store
+	 * holds ONE credential per provider id, shared by every process, so there
+	 * is no slot to lease there.
+	 */
+	claimed: number;
+	/**
+	 * Pool entries serving an in-flight provider request in THIS process,
+	 * oldest first.
+	 *
+	 * A request holds its entry for as long as it runs, so a rotation never
+	 * walks onto a credential that is already serving one. Released when the
+	 * response arrives, and cleared at the turn boundary as a backstop.
+	 */
+	busy: number[];
 }
 
 /** Hidden custom-message type used to request the extra retry turn. */
@@ -322,6 +350,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			injecting: false,
 			pendingContinue: false,
 			continuations: 0,
+			claimed: -1,
+			busy: [],
 		};
 		runtimes.set(providerId, rt);
 		return rt;
@@ -476,6 +506,56 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		injected.delete(providerId);
 		const rt = runtimes.get(providerId);
 		if (rt) rt.injecting = false;
+	}
+
+	// -----------------------------------------------------------------------
+	// Leases: an exclusive claim on one entry of a pool.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The pool entries that must not be picked right now: the ones serving an
+	 * in-flight request in this process, plus the ones another live pi process
+	 * has leased.
+	 *
+	 * The cross-process half is read from the lease directory, so it is only
+	 * consulted for API-key pools — pi's OAuth credential store holds a single
+	 * credential per provider id that every process shares, so an OAuth entry
+	 * cannot be leased away from another process.
+	 */
+	function leasedIndices(rt: ProviderRuntime): ReadonlySet<number> {
+		const leased = new Set<number>(rt.busy);
+		if (rt.kind === "keys") {
+			for (const index of leasedByOthers(rt.providerId, rt.keys.length)) leased.add(index);
+		}
+		return leased;
+	}
+
+	/**
+	 * Move this process's lease onto the entry it just installed.
+	 *
+	 * The claim is what keeps another pi process off the same credential. A
+	 * claim that cannot be taken (another process got there first) is not
+	 * fatal: the entry is still usable, so the request goes out and the next
+	 * pick prefers a different entry.
+	 */
+	function takeLease(rt: ProviderRuntime, index: number): void {
+		if (rt.kind !== "keys" || index < 0) return;
+		if (rt.claimed >= 0 && rt.claimed !== index) releaseLease(rt.providerId, rt.claimed);
+		rt.claimed = claimLease(rt.providerId, index) ? index : -1;
+		if (rt.claimed < 0) trace(`lease ${rt.providerId} entry ${index} (held by another process)`);
+	}
+
+	/**
+	 * Drop every claim this process holds.
+	 *
+	 * Called when the pools are handed back to pi (reset, reload, shutdown):
+	 * the entries are no longer in use, so another process may take them.
+	 */
+	function releaseLeases(): void {
+		for (const rt of runtimes.values()) {
+			releaseLease(rt.providerId, rt.claimed);
+			rt.claimed = -1;
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -989,6 +1069,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			if (!(await applyKey(rt.providerId, entry.value, ctx))) return undefined;
 			setActive(rt, idx);
 			recordUse(entry);
+			// The entry is now the one this process uses: hold the lease on it.
+			takeLease(rt, idx);
 		}
 		return entry;
 	}
@@ -1031,7 +1113,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				trace(`advance skip ${rt.providerId} (startup sweep in flight)`);
 				continue;
 			}
-			const idx = pickStrategyNext(rt.keys, rt.currentIndex, rt.strategy, now);
+			const idx = pickStrategyNext(rt.keys, rt.currentIndex, rt.strategy, now, leasedIndices(rt));
 			const entry = idx >= 0 ? rt.keys[idx] : undefined;
 			if (!entry || idx === rt.currentIndex || !isAvailable(entry, now)) continue;
 			const previousName = rt.keys[rt.currentIndex]?.name ?? "(none)";
@@ -1218,7 +1300,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				injected.delete(providerId);
 			}
 
-			const idx = pickNextKey(rt.keys, rt.resumeIndex, Date.now());
+			const idx = pickNextKey(rt.keys, rt.resumeIndex, Date.now(), leasedIndices(rt));
 			if (idx < 0) continue;
 			const key = rt.keys[idx];
 			if (!key) continue;
@@ -1241,6 +1323,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			// This is the fix for the old bug: the initial key actually gets set.
 			if (await applyKey(providerId, key.value, ctx)) {
 				newlyBootstrapped++;
+				// Hold the lease on the entry this process just took.
+				takeLease(rt, idx);
 				trace(`bootstrap ${providerId} -> ${key.name}`);
 			}
 		}
@@ -1257,6 +1341,41 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				"info",
 			);
 		}
+	}
+
+	/**
+	 * Re-read the config file and re-activate every pool.
+	 *
+	 * Shared by `/keyrouter reload` and by the commands that change the config
+	 * file (`add`, `remove`), so a change is always picked up the same way:
+	 * hand pi back its own credentials, drop the runtime state, load the file
+	 * again, and bootstrap from it.
+	 */
+	async function reloadAll(ctx: ExtensionContext): Promise<void> {
+		if (credentialApi) {
+			for (const providerId of [...injected]) await clearKey(providerId);
+		}
+		for (const providerId of [...installedAccounts]) {
+			const rt = runtimes.get(providerId);
+			if (rt) await restoreSessionStartAccount(providerId, rt);
+		}
+		injected.clear();
+		installedAccounts.clear();
+		// The claims go with the entries they were taken for.
+		releaseLeases();
+		config = loadConfig(ctx.cwd);
+		runtimes.clear();
+		skipReported.clear();
+		permanentSkip.clear();
+		activationNotified = false;
+		warningsReported = false;
+		persistNotifyErrorNotified = false;
+		credentialApiChecked = false;
+		credentialApi = undefined;
+		storeApiChecked = false;
+		storeApi = undefined;
+		lastErrorNotified = false;
+		await activate(ctx);
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1291,9 +1410,26 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		await advanceForStrategy(ctx);
 	});
 
+	// A provider request holds its pool entry for as long as it is in flight, so
+	// a rotation never walks onto a credential that is already serving one.
+	pi.on("before_provider_request", async (_event, ctx) => {
+		const providerId = activeProviderId(ctx);
+		if (!providerId) return;
+		const rt = runtimes.get(providerId);
+		if (!rt || rt.currentIndex < 0) return;
+		rt.busy.push(rt.currentIndex);
+	});
+
 	// Success clears a key's cooldown without touching rotation position, so a
 	// rate-limited key can re-enter the pool instead of being stuck forever.
 	pi.on("after_provider_response", async (event, ctx) => {
+		// The request is done with the credential: its lease is released. The
+		// turn-end backstop covers a request that never produced a response.
+		const leaseProvider = activeProviderId(ctx);
+		if (leaseProvider) {
+			const leased = runtimes.get(leaseProvider);
+			if (leased && leased.busy.length > 0) leased.busy.shift();
+		}
 		if (!config || !event.status || event.status >= 400) return;
 		const providerId = activeProviderId(ctx);
 		if (!providerId) return;
@@ -1380,7 +1516,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		}
 
 		// Find the next available entry (different from the current one).
-		const nextIdx = pickNextKey(rt.keys, rt.currentIndex + 1, Date.now());
+		const nextIdx = pickNextKey(rt.keys, rt.currentIndex + 1, Date.now(), leasedIndices(rt));
 		if (nextIdx < 0 || nextIdx === rt.currentIndex) {
 			// Everything is exhausted.
 			const failed = rt.keys.filter((k) => k.failures > 0).map((k) => k.name);
@@ -1463,6 +1599,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		};
 	});
 
+	// Backstop: the turn is over, so none of its requests is in flight any
+	// more. Anything left in a busy list (a request that never produced a
+	// response) is released here.
+	pi.on("turn_end", async () => {
+		for (const rt of runtimes.values()) rt.busy.length = 0;
+	});
+
 	pi.on("session_shutdown", async () => {
 		// Everything keyrouter wrote is a change to pi's live state, so undo it
 		// explicitly — this process may be reloaded rather than exited.
@@ -1480,6 +1623,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		}
 		injected.clear();
 		installedAccounts.clear();
+		// The lease claims belong to this process alone: release them so another
+		// pi process may use those entries.
+		releaseLeases();
+		releaseOwnLeases();
 		runtimes.clear();
 		skipReported.clear();
 		permanentSkip.clear();
@@ -1496,7 +1643,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("keyrouter", {
-		description: "manage credential pools (status, reload, reset, account, strategy)",
+		description: "manage credential pools (status, reload, reset, account, strategy, add, remove)",
 		getArgumentCompletions: (prefix) =>
 			commandCompletions(prefix, config?.providers ?? loadConfig().providers),
 		handler: async (args, ctx) => {
@@ -1545,7 +1692,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						`  ${providerId} (${rt.kind}, active: ${current?.name ?? "(none)"}, ` +
 							`installed: ${installed ? "yes" : "no"}, source: ${auth.source ?? "none"}${strategySuffix})`,
 					);
-					for (const k of rt.keys) {
+					for (let ki = 0; ki < rt.keys.length; ki++) {
+						const k = rt.keys[ki];
+						if (!k) continue;
 						const marker = k === current ? "→" : "•";
 						const avail = isAvailable(k, Date.now()) ? "" : " (cooldown)";
 						// Show when the credential expires, never the token itself. OAuth
@@ -1563,8 +1712,21 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 								expiry = " expires=unknown";
 							}
 						}
+						// Who is using this entry right now. A lease is an exclusive
+						// claim: "this-session" is this process, a pid is another pi
+						// process, "in-flight" is one of our requests still running.
+						const inFlight = rt.busy.filter((index) => index === ki).length;
+						const owner = rt.kind === "keys" ? leaseOwner(rt.providerId, ki) : undefined;
+						const lease =
+							inFlight > 0
+								? ` lease=in-flight(${inFlight})`
+								: owner === process.pid
+									? " lease=this-session"
+									: owner !== undefined
+										? ` lease=pid ${owner}`
+										: "";
 						lines.push(
-							`    ${marker} ${k.name}  uses=${k.uses} fails=${k.failures} status=${k.lastStatus}${avail}${expiry}`,
+							`    ${marker} ${k.name}  uses=${k.uses} fails=${k.failures} status=${k.lastStatus}${avail}${expiry}${lease}`,
 						);
 					}
 				}
@@ -1572,30 +1734,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (sub === "reload") {
-				if (credentialApi) {
-					for (const providerId of [...injected]) await clearKey(providerId);
-				}
-				for (const providerId of [...installedAccounts]) {
-					const rt = runtimes.get(providerId);
-					if (rt) await restoreSessionStartAccount(providerId, rt);
-				}
-				injected.clear();
-				installedAccounts.clear();
-				config = loadConfig(ctx.cwd);
-				runtimes.clear();
-				skipReported.clear();
-				permanentSkip.clear();
-				activationNotified = false;
-				warningsReported = false;
-				persistNotifyErrorNotified = false;
-				credentialApiChecked = false;
-				credentialApi = undefined;
-				storeApiChecked = false;
-				storeApi = undefined;
-				lastErrorNotified = false;
-				await activate(ctx);
+				await reloadAll(ctx);
 				ctx.ui.notify(
-					`🔑 keyrouter: reloaded (${config.providers.length} provider(s))`,
+					`🔑 keyrouter: reloaded (${config?.providers.length ?? 0} provider(s))`,
 					"info",
 				);
 				return;
@@ -1610,6 +1751,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					const rt = runtimes.get(providerId);
 					if (rt) await restoreSessionStartAccount(providerId, rt);
 				}
+				// The claims go with the entries: pi is using the user's own
+				// credentials again, so this process holds no pool entry.
+				releaseLeases();
 				// Forget the saved position too, or the next session would resume
 				// straight back onto the key this command just handed back.
 				for (const rt of runtimes.values()) setActive(rt, -1);
@@ -1815,6 +1959,153 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
+			if (sub === "add" || sub === "remove") {
+				// Guided credential management.
+				//
+				// Adding an API key asks for the secret here — keyrouter never runs a
+				// login of its own. Adding an OAuth account captures the credential pi
+				// is holding right now, so the user signs in with pi's own /login and
+				// keyrouter takes a copy afterwards. Removing asks for confirmation,
+				// because the credential is deleted from the config file.
+				if (!config || runtimes.size === 0) await activate(ctx);
+				const wanted = parsed.args[0];
+				if (!wanted) {
+					ctx.ui.notify(`🔑 keyrouter: usage — /keyrouter ${parsed.usage}`, "warning");
+					return;
+				}
+				const found = findPool(ctx, config, wanted);
+				if (!found) {
+					const names = (config?.providers ?? []).map((candidate) => candidate.name);
+					ctx.ui.notify(
+						`🔑 keyrouter: no pool named "${wanted}" in ${configPath()}. ` +
+							(names.length > 0 ? `Pools: ${names.join(", ")}.` : "No pools are configured."),
+						"warning",
+					);
+					return;
+				}
+				const { providerId, pool } = found;
+				const entries: { name: string }[] =
+					pool.kind === "oauth" ? (pool.accounts ?? []) : (pool.keys ?? []);
+
+				if (sub === "remove") {
+					const label = parsed.args[1];
+					if (!label) {
+						ctx.ui.notify(
+							`🔑 keyrouter: usage — /keyrouter ${parsed.usage}\n` +
+								`Entries in ${pool.name}: ${entries.map((entry) => entry.name).join(", ") || "(none)"}`,
+							"warning",
+						);
+						return;
+					}
+					const entry = matchEntry(entries, label);
+					if (!entry) {
+						ctx.ui.notify(
+							`🔑 keyrouter: no entry "${label}" in ${pool.name}. ` +
+								`Available: ${entries.map((candidate) => candidate.name).join(", ") || "(none)"}`,
+							"warning",
+						);
+						return;
+					}
+					const confirmed = await ctx.ui.confirm(
+						`Remove ${entry.name} from ${pool.name}?`,
+						"The credential is deleted from keyrouter.json. pi's own login is not touched.",
+					);
+					if (!confirmed) {
+						ctx.ui.notify("🔑 keyrouter: nothing removed.", "info");
+						return;
+					}
+					const removed = writeBackPoolEntry(pool.name, "remove", { name: entry.name });
+					if ("error" in removed) {
+						ctx.ui.notify(
+							`🔑 keyrouter: could not update ${configPath()} — ${removed.error}.`,
+							"warning",
+						);
+						return;
+					}
+					await reloadAll(ctx);
+					trace(`remove ${pool.name} ${entry.name}`);
+					ctx.ui.notify(`🔑 keyrouter: removed ${entry.name} from ${pool.name}.`, "info");
+					return;
+				}
+
+				// add
+				let name = parsed.args[1]?.trim();
+				let value: string | undefined;
+				let credential: OAuthCredential | undefined;
+				if (pool.kind === "keys") {
+					const entered = await ctx.ui.input(
+						`API key for ${pool.name}${name ? `/${name}` : ""}`,
+						"paste the key — it is stored in keyrouter.json",
+					);
+					if (entered === undefined) {
+						ctx.ui.notify("🔑 keyrouter: cancelled — nothing was added.", "info");
+						return;
+					}
+					value = entered.trim();
+					if (!value) {
+						ctx.ui.notify("🔑 keyrouter: cancelled — the key was empty.", "info");
+						return;
+					}
+					if (!name) name = `key-${entries.length + 1}`;
+				} else {
+					// OAuth: pi owns the login, so the credential is taken from pi.
+					if (!storeApi) {
+						ctx.ui.notify(
+							"🔑 keyrouter: pi's credential store is unavailable in this build — cannot capture an account.",
+							"warning",
+						);
+						return;
+					}
+					credential = await captureCredential(storeApi, providerId);
+					if (!credential) {
+						ctx.ui.notify(
+							`🔑 keyrouter: pi has no login for ${providerId}. Run /login first, then /keyrouter add ${pool.name}.`,
+							"warning",
+						);
+						return;
+					}
+					// While keyrouter is active the pool's own account is what pi holds:
+					// adding it again would duplicate an entry, not add an account.
+					const duplicate = (pool.accounts ?? []).find((account) =>
+						sameCredential(account.credential, credential),
+					);
+					if (duplicate) {
+						ctx.ui.notify(
+							`🔑 keyrouter: pi is already using "${duplicate.name}". Run /login to sign in to another account first.`,
+							"warning",
+						);
+						return;
+					}
+					const label = identityLabel(credential);
+					if (!name) {
+						// A readable name is worth having when it is a plain token (an
+						// account id or an address); anything else gets a numbered name.
+						name =
+							label && /^[A-Za-z0-9._@+-]{1,40}$/.test(label)
+								? label
+								: `account-${entries.length + 1}`;
+					}
+				}
+				if (entries.some((entry) => entry.name === name)) {
+					ctx.ui.notify(`🔑 keyrouter: "${name}" already exists in ${pool.name}.`, "warning");
+					return;
+				}
+				const added = writeBackPoolEntry(pool.name, "add", { name, value, credential });
+				if ("error" in added) {
+					ctx.ui.notify(
+						`🔑 keyrouter: could not update ${configPath()} — ${added.error}.`,
+						"warning",
+					);
+					return;
+				}
+				await reloadAll(ctx);
+				trace(`add ${pool.name} ${name}`);
+				ctx.ui.notify(
+					`🔑 keyrouter: added ${name} to ${pool.name}. It joins the pool on the next turn.`,
+					"info",
+				);
+				return;
+			}
 			ctx.ui.notify(`Usage: /keyrouter [${SUBCOMMANDS.join("|")}]`, "info");
 		},
 	});
@@ -1822,8 +2113,58 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 
 
 
+/**
+ * Find the configured pool the user meant.
+ *
+ * The pool is matched by the name written in `keyrouter.json` first, then by
+ * the provider id pi resolves that name to — the two differ when a provider id
+ * is canonicalized (`z-ai` -> `zai`), and the config file is never rewritten
+ * to the canonical form.
+ */
+function findPool(
+	ctx: ExtensionContext,
+	config: KeyRouterConfig | undefined,
+	wanted: string,
+): { providerId: string; pool: ProviderPoolConfig } | undefined {
+	if (!config) return undefined;
+	const exact = config.providers.find((pool) => pool.name === wanted);
+	if (exact) {
+		return { providerId: resolveProviderId(ctx.modelRegistry, exact.name), pool: exact };
+	}
+	const providerId = resolveProviderId(ctx.modelRegistry, wanted);
+	const pool = config.providers.find(
+		(candidate) => resolveProviderId(ctx.modelRegistry, candidate.name) === providerId,
+	);
+	return pool ? { providerId, pool } : undefined;
+}
+
+/**
+ * Match a pool entry by exact name, then case-insensitively, then by its
+ * 1-based position in the pool.
+ */
+function matchEntry<T extends { name: string }>(entries: readonly T[], label: string): T | undefined {
+	const exact = entries.find((entry) => entry.name === label);
+	if (exact) return exact;
+	const lower = label.toLowerCase();
+	const insensitive = entries.find((entry) => entry.name.toLowerCase() === lower);
+	if (insensitive) return insensitive;
+	if (/^\d+$/.test(label)) {
+		const ordinal = Number(label) - 1;
+		return ordinal >= 0 && ordinal < entries.length ? entries[ordinal] : undefined;
+	}
+	return undefined;
+}
+
 /** Subcommands accepted by `/keyrouter`, in usage order. */
-export const SUBCOMMANDS = ["status", "reload", "reset", "account", "strategy"] as const;
+export const SUBCOMMANDS = [
+	"status",
+	"reload",
+	"reset",
+	"account",
+	"strategy",
+	"add",
+	"remove",
+] as const;
 
 /**
  * Parse `/keyrouter` arguments into a subcommand plus its operands.
@@ -1855,7 +2196,11 @@ export function parseCommandArgs(args: string): {
 			? "account <provider> [name|index]"
 			: sub === "strategy"
 				? "strategy <provider> [strategy]"
-				: sub;
+				: sub === "add"
+					? "add <provider> [name]"
+					: sub === "remove"
+						? "remove <provider> <name|index>"
+						: sub;
 	return { sub, args: rest, usage };
 }
 
@@ -1866,6 +2211,8 @@ const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
 	reset: "hand providers back to pi's own credentials",
 	account: "pin a specific key or account",
 	strategy: "show or set a pool's rotation strategy",
+	add: "add a key or an account to a pool",
+	remove: "remove a key or an account from a pool",
 };
 
 /** Descriptions shown next to each strategy value in the completion menu. */
@@ -1915,10 +2262,9 @@ export function commandCompletions(
 		);
 	}
 
-	// Only `account` and `strategy` take operands; the rest are complete on
-	// their own.
+	// Only these take operands; the rest are complete on their own.
 	const sub = done[0]?.toLowerCase();
-	if (sub !== "account" && sub !== "strategy") return null;
+	if (sub !== "account" && sub !== "strategy" && sub !== "add" && sub !== "remove") return null;
 	if (done.length > 2) return null;
 
 	// First operand, shared by both: the pool names.
@@ -1954,7 +2300,10 @@ export function commandCompletions(
 		);
 	}
 
-	// `account`: the entries of the pool named in `done[1]`.
+	// `add` takes a free-form name, so there is nothing to suggest.
+	if (sub === "add") return null;
+
+	// `account` and `remove`: the entries of the pool named in `done[1]`.
 	const entries = pool.kind === "oauth" ? (pool.accounts ?? []) : (pool.keys ?? []);
 	return items(
 		entries
@@ -1962,7 +2311,7 @@ export function commandCompletions(
 			// No trailing space: this is the last token, and a space would only
 			// invite a fourth one that means nothing.
 			.map((entry) => ({
-				value: `account ${pool.name} ${entry.name}`,
+				value: `${sub} ${pool.name} ${entry.name}`,
 				label: entry.name,
 				description: pool.active === entry.name ? "active" : undefined,
 			})),
