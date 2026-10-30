@@ -107,6 +107,15 @@ import type {
 const tracePath = process.env["PI_KEYROUTER_TRACE"] || undefined;
 
 /**
+ * TEMPORARY/INTERNAL: the session-start sweep is disabled by default for testing.
+ * `PI_KEYROUTER_SWEEP=1` is the only opt-in. This flag must not be documented
+ * publicly and should be removed once the sweep is safe to run again.
+ */
+export function startupSweepEnabled(env?: Record<string, string | undefined>): boolean {
+	return env?.["PI_KEYROUTER_SWEEP"] === "1";
+}
+
+/**
  * `ui.notify` before a UI context exists is a silent no-op, so a warning raised during
  * bootstrap has to be queued. `deepEqual` is its own exported helper.
  *
@@ -1393,9 +1402,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		await activate(ctx);
 		// Keep idle pool accounts alive without holding up the session: the sweep
 		// never touches pi's store, so it cannot race the first turn.
-		void sweepIdleAccounts(ctx).catch((error) => {
-			trace(`sweep error ${error instanceof Error ? error.message : String(error)}`);
-		});
+		if (startupSweepEnabled(process.env)) {
+			void sweepIdleAccounts(ctx).catch((error) => {
+				trace(`sweep error ${error instanceof Error ? error.message : String(error)}`);
+			});
+		} else {
+			trace("startup sweep skipped (PI_KEYROUTER_SWEEP is not set to 1)");
+		}
 	});
 
 	// Lazy bootstrap: also fire on every turn. This handles /reload (which

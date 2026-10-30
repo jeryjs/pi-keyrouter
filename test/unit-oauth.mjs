@@ -49,6 +49,7 @@ const {
 	SUBCOMMANDS,
 	alreadyUsingMessage,
 	planOAuthAddition,
+	startupSweepEnabled,
 } = await import("../index.ts");
 
 let failures = 0;
@@ -1117,6 +1118,17 @@ try {
 } finally {
 	rmSync(leaseHome, { recursive: true, force: true });
 }
+
+// ---------------------------------------------------------------------------
+// 12. startup sweep — temporary internal gate
+// ---------------------------------------------------------------------------
+check("startup sweep is disabled when the flag is unset", !startupSweepEnabled({}));
+check("startup sweep is disabled when the flag is 0", !startupSweepEnabled({ PI_KEYROUTER_SWEEP: "0" }));
+check("startup sweep is enabled when the flag is 1", startupSweepEnabled({ PI_KEYROUTER_SWEEP: "1" }));
+check(
+	"startup sweep is disabled for an arbitrary other flag value",
+	!startupSweepEnabled({ PI_KEYROUTER_SWEEP: "enabled" }),
+);
 
 console.log(failures === 0 ? "\nall oauth unit tests pass" : `\n${failures} unit test(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
