@@ -42,6 +42,7 @@ import {
 	writeBackActive,
 	writeBackStrategy,
 	writeBackPoolEntry,
+	uniquePoolEntryName,
 	normalizeStrategy,
 	STRATEGIES,
 } from "./config.ts";
@@ -86,6 +87,7 @@ import {
 	recordUse,
 } from "./rotation.ts";
 import type {
+	AccountEntry,
 	KeyRouterConfig,
 	KeyState,
 	OAuthCredential,
@@ -2029,12 +2031,11 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				}
 
 				// add
-				let name = parsed.args[1]?.trim();
+				const requestedName = parsed.args[1]?.trim() || undefined;
 				let value: string | undefined;
-				let credential: OAuthCredential | undefined;
 				if (pool.kind === "keys") {
 					const entered = await ctx.ui.input(
-						`API key for ${pool.name}${name ? `/${name}` : ""}`,
+						`API key for ${pool.name}${requestedName ? `/${requestedName}` : ""}`,
 						"paste the key — it is stored in keyrouter.json",
 					);
 					if (entered === undefined) {
@@ -2046,65 +2047,216 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						ctx.ui.notify("🔑 keyrouter: cancelled — the key was empty.", "info");
 						return;
 					}
-					if (!name) name = `key-${entries.length + 1}`;
-				} else {
-					// OAuth: pi owns the login, so the credential is taken from pi.
-					if (!storeApi) {
-						ctx.ui.notify(
-							"🔑 keyrouter: pi's credential store is unavailable in this build — cannot capture an account.",
-							"warning",
-						);
+
+					// An explicit existing name means UPDATE THAT ENTRY IN PLACE.
+					const existing = requestedName
+						? (pool.keys ?? []).find((entry) => entry.name === requestedName)
+						: undefined;
+					if (existing) {
+						const updated = writeBackPoolEntry(pool.name, "update", {
+							name: existing.name,
+							value,
+						});
+						if ("error" in updated) {
+							ctx.ui.notify(
+								`🔑 keyrouter: could not update ${configPath()} — ${updated.error}.`,
+								"warning",
+							);
+							return;
+						}
+						if (updated.updated === 0) {
+							ctx.ui.notify(
+								`🔑 keyrouter: "${existing.name}" in ${pool.name} is already up to date.`,
+								"info",
+							);
+							return;
+						}
+						await reloadAll(ctx);
+						trace(`update ${pool.name} ${existing.name}`);
+						ctx.ui.notify(`🔑 keyrouter: updated ${existing.name} in ${pool.name}.`, "info");
 						return;
 					}
-					credential = await captureCredential(storeApi, providerId);
-					if (!credential) {
-						ctx.ui.notify(
-							`🔑 keyrouter: pi has no login for ${providerId}. Run /login first, then /keyrouter add ${pool.name}.`,
-							"warning",
-						);
-						return;
-					}
-					// While keyrouter is active the pool's own account is what pi holds:
-					// adding it again would duplicate an entry, not add an account.
-					const duplicate = (pool.accounts ?? []).find((account) =>
-						sameCredential(account.credential, credential),
+
+					const base = requestedName ?? `key-${entries.length + 1}`;
+					const generated = uniquePoolEntryName(
+						base,
+						entries.map((entry) => entry.name),
 					);
-					if (duplicate) {
+					const added = writeBackPoolEntry(pool.name, "add", {
+						name: generated.name,
+						value,
+					});
+					if ("error" in added) {
 						ctx.ui.notify(
-							`🔑 keyrouter: pi is already using "${duplicate.name}". Run /login to sign in to another account first.`,
+							`🔑 keyrouter: could not update ${configPath()} — ${added.error}.`,
 							"warning",
 						);
 						return;
 					}
-					const label = identityLabel(credential);
-					if (!name) {
-						// A readable name is worth having when it is a plain token (an
-						// account id or an address); anything else gets a numbered name.
-						name =
-							label && /^[A-Za-z0-9._@+-]{1,40}$/.test(label)
-								? label
-								: `account-${entries.length + 1}`;
+					if (added.updated === 0) {
+						ctx.ui.notify(`🔑 keyrouter: nothing was added to ${pool.name}.`, "info");
+						return;
 					}
-				}
-				if (entries.some((entry) => entry.name === name)) {
-					ctx.ui.notify(`🔑 keyrouter: "${name}" already exists in ${pool.name}.`, "warning");
+					await reloadAll(ctx);
+					if (generated.adjusted) {
+						ctx.ui.notify(
+							`🔑 keyrouter: adjusted the generated name to "${generated.name}" because "${base}" is already in use.`,
+							"warning",
+						);
+					}
+					trace(`add ${pool.name} ${generated.name}`);
+					ctx.ui.notify(
+						`🔑 keyrouter: added ${generated.name} to ${pool.name}. It joins the pool on the next turn.`,
+						"info",
+					);
 					return;
 				}
-				const added = writeBackPoolEntry(pool.name, "add", { name, value, credential });
-				if ("error" in added) {
+
+				// OAuth: pi owns the login, so the credential is taken from pi.
+				if (!storeApi) {
 					ctx.ui.notify(
-						`🔑 keyrouter: could not update ${configPath()} — ${added.error}.`,
+						"🔑 keyrouter: pi's credential store is unavailable in this build — cannot capture an account.",
 						"warning",
 					);
 					return;
 				}
-				await reloadAll(ctx);
-				trace(`add ${pool.name} ${name}`);
-				ctx.ui.notify(
-					`🔑 keyrouter: added ${name} to ${pool.name}. It joins the pool on the next turn.`,
-					"info",
-				);
-				return;
+				const credential = await captureCredential(storeApi, providerId);
+				if (!credential) {
+					ctx.ui.notify(
+						`🔑 keyrouter: pi has no login for ${providerId}. Run /login first, then /keyrouter add ${pool.name}.`,
+						"warning",
+					);
+					return;
+				}
+
+				const addAccount = async (explicitName?: string): Promise<void> => {
+					const label = identityLabel(credential);
+					const base =
+						explicitName ??
+						(label && /^[A-Za-z0-9._@+-]{1,40}$/.test(label)
+							? label
+							: `account-${entries.length + 1}`);
+					const generated = uniquePoolEntryName(
+						base,
+						entries.map((entry) => entry.name),
+					);
+					const added = writeBackPoolEntry(pool.name, "add", {
+						name: generated.name,
+						credential,
+					});
+					if ("error" in added) {
+						ctx.ui.notify(
+							`🔑 keyrouter: could not update ${configPath()} — ${added.error}.`,
+							"warning",
+						);
+						return;
+					}
+					if (added.updated === 0) {
+						ctx.ui.notify(`🔑 keyrouter: nothing was added to ${pool.name}.`, "info");
+						return;
+					}
+					await reloadAll(ctx);
+					if (generated.adjusted) {
+						ctx.ui.notify(
+							`🔑 keyrouter: adjusted the generated name to "${generated.name}" because "${base}" is already in use.`,
+							"warning",
+						);
+					}
+					trace(`add ${pool.name} ${generated.name}`);
+					ctx.ui.notify(
+						`🔑 keyrouter: added ${generated.name} to ${pool.name}. It joins the pool on the next turn.`,
+						"info",
+					);
+				};
+
+				const updateAccount = async (target: {
+					name: string;
+					credential?: OAuthCredential;
+				}): Promise<void> => {
+					// An explicit retarget is allowed, but only after the user confirms
+					// that the named account really has a different identity.
+					const targetState = initAccountStates([target])[0];
+					if (!targetState) return;
+					const tripwire = checkTripwire({
+						target: targetState,
+						credential,
+						identityPath: pool.identityPath,
+					});
+					if (!tripwire.ok) {
+						const confirmed = await ctx.ui.confirm(
+							`Replace account "${target.name}" in ${pool.name}?`,
+							"pi's current login has a different account identity. Confirming replaces that entry with pi's current credential.",
+						);
+						if (!confirmed) {
+							ctx.ui.notify("🔑 keyrouter: nothing changed.", "info");
+							return;
+						}
+					}
+					const updated = writeBackPoolEntry(pool.name, "update", {
+						name: target.name,
+						credential,
+					});
+					if ("error" in updated) {
+						ctx.ui.notify(
+							`🔑 keyrouter: could not update ${configPath()} — ${updated.error}.`,
+							"warning",
+						);
+						return;
+					}
+					if (updated.updated === 0) {
+						ctx.ui.notify(
+							`🔑 keyrouter: "${target.name}" in ${pool.name} is already up to date.`,
+							"info",
+						);
+						return;
+					}
+					await reloadAll(ctx);
+					trace(`update ${pool.name} ${target.name}`);
+					ctx.ui.notify(`🔑 keyrouter: updated ${target.name} in ${pool.name}.`, "info");
+				};
+
+				const accounts = pool.accounts ?? [];
+				const plan = planOAuthAddition({
+					credential,
+					accounts,
+					requestedName,
+					identityPath: pool.identityPath,
+				});
+				if (plan.kind === "update") {
+					await updateAccount(plan.target);
+					return;
+				}
+
+				if (plan.kind === "duplicate") {
+					ctx.ui.notify(alreadyUsingMessage(plan.name), "warning");
+					return;
+				}
+				if (plan.kind === "ambiguous") {
+					ctx.ui.notify(
+						`🔑 keyrouter: pi's current login for ${providerId} matches more than one account (${plan.names.join(", ")}). ` +
+							"Name the account to update explicitly, or set identityPath for this provider.",
+						"warning",
+					);
+					return;
+				}
+				if (plan.kind === "prompt") {
+					const choice = await ctx.ui.select(
+						`pi's current ${pool.name} login matches account "${plan.target.name}". What should /keyrouter add do?`,
+						[plan.updateOption, plan.addOption, plan.cancelOption],
+					);
+					if (choice === plan.updateOption) {
+						await updateAccount(plan.target);
+						return;
+					}
+					if (choice === plan.addOption) {
+						await addAccount(plan.addName);
+						return;
+					}
+					ctx.ui.notify("🔑 keyrouter: cancelled — nothing was added.", "info");
+					return;
+				}
+
+				await addAccount(plan.name);
 			}
 			ctx.ui.notify(`Usage: /keyrouter [${SUBCOMMANDS.join("|")}]`, "info");
 		},
@@ -2153,6 +2305,72 @@ function matchEntry<T extends { name: string }>(entries: readonly T[], label: st
 		return ordinal >= 0 && ordinal < entries.length ? entries[ordinal] : undefined;
 	}
 	return undefined;
+}
+
+/** The decision made after `/keyrouter add` captures pi's live OAuth credential. */
+export type OAuthAdditionPlan =
+	| { kind: "update"; target: AccountEntry }
+	| { kind: "duplicate"; name: string }
+	| {
+			kind: "prompt";
+			target: AccountEntry;
+			updateOption: string;
+			addOption: string;
+			cancelOption: string;
+			/** The name to use if the user chooses add-as-new. */
+			addName: string | undefined;
+	  }
+	| { kind: "ambiguous"; names: string[] }
+	| { kind: "add"; name: string | undefined };
+
+/**
+ * Plan an OAuth addition without touching the TUI.
+ *
+ * The order is deliberate: an explicitly named existing entry is updated; an
+ * exact credential elsewhere is refused; then identity attribution runs even
+ * when the requested name is new. That last step is what prevents a named
+ * addition from silently duplicating an account identity.
+ */
+export function planOAuthAddition(args: {
+	credential: OAuthCredential;
+	accounts: ReadonlyArray<AccountEntry>;
+	requestedName?: string | undefined;
+	identityPath?: string | undefined;
+}): OAuthAdditionPlan {
+	const { credential, accounts, requestedName, identityPath } = args;
+	const explicitTarget = requestedName
+		? accounts.find((account) => account.name === requestedName)
+		: undefined;
+	if (explicitTarget) return { kind: "update", target: explicitTarget };
+
+	const duplicate = accounts.find((account) => sameCredential(account.credential, credential));
+	if (duplicate) return { kind: "duplicate", name: duplicate.name };
+
+	const attribution = attributeCredential({
+		credential,
+		states: accounts,
+		activeName: undefined,
+		expectedName: undefined,
+		installedByUs: false,
+		identityPath,
+	});
+	if (attribution.kind === "ambiguous") {
+		return { kind: "ambiguous", names: attribution.names };
+	}
+	if (attribution.kind === "match") {
+		const target = accounts[attribution.index];
+		if (target) {
+			return {
+				kind: "prompt",
+				target,
+				updateOption: `Update existing account "${target.name}"`,
+				addOption: "Add current login as a new account",
+				cancelOption: "Cancel",
+				addName: requestedName,
+			};
+		}
+	}
+	return { kind: "add", name: requestedName };
 }
 
 /** Subcommands accepted by `/keyrouter`, in usage order. */
@@ -2316,6 +2534,11 @@ export function commandCompletions(
 				description: pool.active === entry.name ? "active" : undefined,
 			})),
 	);
+}
+
+/** The exact refusal shown when pi already holds a credential from the pool. */
+export function alreadyUsingMessage(name: string): string {
+	return `🔑 keyrouter: pi is already using "${name}". Run \`/login\` to sign in to another account first and then call \`/keyrouter add\` again.`;
 }
 
 /**

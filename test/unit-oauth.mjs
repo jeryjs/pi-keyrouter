@@ -27,6 +27,7 @@ const {
 	configPath,
 	writeBackActive,
 	writeBackPoolEntry,
+	uniquePoolEntryName,
 } = await import("../config.ts");
 const { initAccountStates, initKeyStates, markBad, isAvailable, pickNextKey } = await import("../rotation.ts");
 const {
@@ -39,7 +40,8 @@ const {
 // Importing index.ts binds no pi APIs at module scope (the extension only
 // registers handlers inside its default export), so the pure command parser is
 // reachable from a plain Node process.
-const { parseCommandArgs, commandCompletions, SUBCOMMANDS } = await import("../index.ts");
+const { parseCommandArgs, commandCompletions, SUBCOMMANDS, alreadyUsingMessage, planOAuthAddition } =
+	await import("../index.ts");
 
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -438,6 +440,84 @@ check("remove accepts an ordinal", parseCommandArgs("remove cline 2").args[1] ==
 check("remove usage is self-describing", /remove <provider>/.test(removeCmd.usage));
 check("remove is case-insensitive", parseCommandArgs("REMOVE cline").sub === "remove");
 
+check(
+	"the already-using refusal has the exact required wording",
+	alreadyUsingMessage("work") ===
+		'🔑 keyrouter: pi is already using "work". Run `/login` to sign in to another account first and then call `/keyrouter add` again.',
+);
+check(
+	"a generated name collision gets the first free numbered suffix",
+	uniquePoolEntryName("work", ["work"]).name === "work-2" &&
+		uniquePoolEntryName("work", ["work"]).adjusted === true,
+);
+check(
+	"a generated name collision skips an occupied suffix",
+	uniquePoolEntryName("work", ["work", "work-2"]).name === "work-3",
+);
+check(
+	"an unused generated name is not adjusted",
+	uniquePoolEntryName("work", ["other"]).name === "work" &&
+		uniquePoolEntryName("work", ["other"]).adjusted === false,
+);
+
+const identityPool = [
+	{
+		name: "jsjery123",
+		credential: {
+			type: "oauth",
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 1000,
+			accountId: "account-123",
+		},
+	},
+];
+const liveSameIdentity = {
+	type: "oauth",
+	access: "new-access",
+	refresh: "new-refresh",
+	expires: 2000,
+	accountId: "account-123",
+};
+const namedIdentityPlan = planOAuthAddition({
+	credential: liveSameIdentity,
+	accounts: identityPool,
+	requestedName: "custom-new-name",
+	identityPath: "accountId",
+});
+check(
+	"a requested new name still prompts when the login matches an existing identity",
+	namedIdentityPlan.kind === "prompt" && namedIdentityPlan.target.name === "jsjery123",
+);
+check(
+	"the add-as-new choice preserves the explicitly requested name",
+	namedIdentityPlan.kind === "prompt" && namedIdentityPlan.addName === "custom-new-name",
+);
+check(
+	"the identity prompt keeps update first and add-as-new second",
+	namedIdentityPlan.kind === "prompt" &&
+		namedIdentityPlan.updateOption === 'Update existing account "jsjery123"' &&
+		namedIdentityPlan.addOption === "Add current login as a new account",
+);
+check(
+	"an explicitly existing target remains an in-place update",
+	planOAuthAddition({
+		credential: liveSameIdentity,
+		accounts: identityPool,
+		requestedName: "jsjery123",
+		identityPath: "accountId",
+	}).kind === "update",
+);
+check(
+	"an exact duplicate elsewhere still refuses before identity prompting",
+	planOAuthAddition({
+		credential: identityPool[0].credential,
+		accounts: identityPool,
+		requestedName: "custom-new-name",
+		identityPath: "accountId",
+	}).kind === "duplicate",
+);
+
 // ---------------------------------------------------------------------------
 // 10. commandCompletions — the /keyrouter completion menu
 //
@@ -571,9 +651,11 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 		providers: [
 			{
 				name: "cline",
+				_customProviderField: "must-survive",
 				accounts: [
 					{
 						name: "a1",
+						note: "keep-entry-field",
 						credential: { type: "oauth", access: "old-access", refresh: "refresh-1", expires: 1000, accountId: "keep-me" },
 					},
 					{ name: "a2", credential: { type: "oauth", access: "untouched", refresh: "refresh-2", expires: 2000 } },
@@ -671,6 +753,131 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 		"the account entry keeps its credential",
 		pool.providers[0].accounts[2].name === "a3" && pool.providers[0].accounts[2].credential.access === "new-access",
 	);
+
+	// `update` changes only the named entry's credential. Its position, sibling
+	// entries, provider fields, and unknown top-level fields all stay put.
+	const updatedAccount = writeBackPoolEntry("cline", "update", {
+		name: "a1",
+		credential: {
+			type: "oauth",
+			access: "replacement-access",
+			refresh: "replacement-refresh",
+			expires: 4000,
+			accountId: "replacement-id",
+		},
+	});
+	check("an OAuth account can be updated in place", updatedAccount.updated === 1);
+	pool = JSON.parse(readFileSync(persistFile, "utf8"));
+	check(
+		"the update replaces the targeted credential",
+		pool.providers[0].accounts[0].credential.access === "replacement-access" &&
+			pool.providers[0].accounts[0].credential.refresh === "replacement-refresh" &&
+			pool.providers[0].accounts[0].credential.expires === 4000,
+	);
+	check(
+		"the update preserves the entry's other fields and position",
+		pool.providers[0].accounts[0].name === "a1" &&
+			pool.providers[0].accounts[0].note === "keep-entry-field",
+	);
+	check(
+		"the update preserves sibling accounts and provider fields",
+		pool.providers[0].accounts[1].name === "a2" &&
+			pool.providers[0].accounts[2].name === "a3" &&
+			pool.providers[0]._customProviderField === "must-survive" &&
+			pool._customTopLevelField === "must-survive",
+	);
+	const beforeNoopUpdate = readFileSync(persistFile, "utf8");
+	const noopAccountUpdate = writeBackPoolEntry("cline", "update", {
+		name: "a1",
+		credential: {
+			type: "oauth",
+			access: "replacement-access",
+			refresh: "replacement-refresh",
+			expires: 4000,
+			accountId: "replacement-id",
+		},
+	});
+	check("an identical OAuth update is a no-op", noopAccountUpdate.updated === 0);
+	check("a no-op OAuth update does not rewrite the file", readFileSync(persistFile, "utf8") === beforeNoopUpdate);
+
+	const updatedKey = writeBackPoolEntry("google", "update", { name: "k2", value: "sk-replaced" });
+	check("an API key can be updated in place", updatedKey.updated === 1);
+	pool = JSON.parse(readFileSync(persistFile, "utf8"));
+	check(
+		"the API-key update changes only the value",
+		pool.providers[1].keys[1].name === "k2" && pool.providers[1].keys[1].value === "sk-replaced",
+	);
+	check(
+		"an unknown update target is a no-op",
+		writeBackPoolEntry("google", "update", { name: "missing", value: "x" }).updated === 0,
+	);
+
+	// External-backed entries are refused from the RAW file. The normalized
+	// in-memory value has already lost the reference, so the writer is the place
+	// where this can be enforced safely.
+	const externalSource = join(persistDir, "external-credential.json");
+	writeFileSync(externalSource, JSON.stringify(VALID), "utf8");
+	const externalConfig = join(persistDir, "external-config.json");
+	const externalRaw = {
+		providers: [
+			{
+				name: "ext-oauth",
+				accounts: [
+					{ name: "env", credential: "$EXT_ACCOUNT" },
+					{ name: "braced", credential: "${EXT_ACCOUNT}" },
+					{ name: "file", credential: `@${externalSource}` },
+				],
+			},
+			{
+				name: "ext-keys",
+				keys: [
+					{ name: "env", value: "$EXT_KEY" },
+					{ name: "braced", value: "${EXT_KEY}" },
+					{ name: "file", value: `@${externalSource}` },
+				],
+			},
+		],
+	};
+	writeFileSync(externalConfig, JSON.stringify(externalRaw, null, 2) + "\n", "utf8");
+	process.env.PI_KEYROUTER_CONFIG = externalConfig;
+	const externalBefore = readFileSync(externalConfig, "utf8");
+	const envAccountUpdate = writeBackPoolEntry("ext-oauth", "update", { name: "env", credential: VALID });
+	check(
+		"an OAuth environment reference refuses an in-place update",
+		"error" in envAccountUpdate && envAccountUpdate.error.includes("EXT_ACCOUNT"),
+	);
+	const bracedAccountUpdate = writeBackPoolEntry("ext-oauth", "update", { name: "braced", credential: VALID });
+	check(
+		"a braced OAuth environment reference refuses an in-place update",
+		"error" in bracedAccountUpdate && bracedAccountUpdate.error.includes("EXT_ACCOUNT"),
+	);
+	const fileAccountUpdate = writeBackPoolEntry("ext-oauth", "update", { name: "file", credential: VALID });
+	check(
+		"an OAuth file reference refuses an in-place update and names the file",
+		"error" in fileAccountUpdate && fileAccountUpdate.error.includes(externalSource),
+	);
+	const envKeyUpdate = writeBackPoolEntry("ext-keys", "update", { name: "env", value: "replacement" });
+	check(
+		"an API-key environment reference refuses an in-place update",
+		"error" in envKeyUpdate && envKeyUpdate.error.includes("EXT_KEY"),
+	);
+	const bracedKeyUpdate = writeBackPoolEntry("ext-keys", "update", { name: "braced", value: "replacement" });
+	check(
+		"a braced API-key environment reference refuses an in-place update",
+		"error" in bracedKeyUpdate && bracedKeyUpdate.error.includes("EXT_KEY"),
+	);
+	const fileKeyUpdate = writeBackPoolEntry("ext-keys", "update", { name: "file", value: "replacement" });
+	check(
+		"an API-key file reference refuses an in-place update and names the file",
+		"error" in fileKeyUpdate && fileKeyUpdate.error.includes(externalSource),
+	);
+	check("external-backed updates leave the raw config unchanged", readFileSync(externalConfig, "utf8") === externalBefore);
+	check("external-backed updates leave the external source unchanged", readFileSync(externalSource, "utf8") === JSON.stringify(VALID));
+	check(
+		"external-reference errors never contain the replacement secret",
+		!("error" in envAccountUpdate) || !envAccountUpdate.error.includes("access-x"),
+	);
+	process.env.PI_KEYROUTER_CONFIG = persistFile;
 
 	writeBackActive("google", "k2");
 	check("the entry is removed", writeBackPoolEntry("google", "remove", { name: "k2" }).updated === 1);

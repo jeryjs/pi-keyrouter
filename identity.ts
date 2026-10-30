@@ -356,7 +356,7 @@ export type Attribution =
  */
 export function attributeCredential(args: {
 	credential: OAuthCredential;
-	states: ReadonlyArray<KeyState>;
+	states: ReadonlyArray<Pick<KeyState, "name" | "credential">>;
 	activeName: string | undefined;
 	expectedName: string | undefined;
 	/** True when keyrouter itself installed the credential currently in pi. */

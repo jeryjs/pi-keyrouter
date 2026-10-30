@@ -425,8 +425,67 @@ export function writeBackStrategy(
 	return { updated };
 }
 
+type ExternalPoolReference =
+	| { kind: "environment"; target: string }
+	| { kind: "file"; target: string };
+
 /**
- * Add or remove ONE entry of a pool, in place.
+ * Detect an external source in a RAW pool field.
+ *
+ * The normalized config has already expanded these references, so this check is
+ * deliberately done against the string still present in the file. An OAuth
+ * credential may be stored in `$ENV` / `${ENV}` / `@file`; an API-key value may
+ * use the same environment-variable forms. Those sources belong to the user and
+ * must not be replaced with an inline secret by an in-place update.
+ */
+function externalPoolReference(raw: unknown): ExternalPoolReference | undefined {
+	if (typeof raw !== "string") return undefined;
+	const trimmed = raw.trim();
+	if (trimmed.startsWith("@")) {
+		return { kind: "file", target: trimmed.slice(1).trim() || trimmed };
+	}
+	// Match one environment reference, but not the escaped `$$NAME` form.
+	const match = /(?<!\$)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(trimmed);
+	const variable = match?.[1] ?? match?.[2];
+	return variable ? { kind: "environment", target: variable } : undefined;
+}
+
+/** Explain why an external-backed entry cannot be updated in place. */
+function externalReferenceError(
+	providerName: string,
+	entryName: string,
+	field: "value" | "credential",
+	reference: ExternalPoolReference,
+): string {
+	const source =
+		reference.kind === "environment"
+			? `environment variable "${reference.target}"`
+			: `file "${reference.target}"`;
+	const action = reference.kind === "environment" ? "update that environment variable instead" : "update that file instead";
+	return `refusing to update "${entryName}" in "${providerName}": ${field} is stored in ${source}; ${action}`;
+}
+
+/**
+ * Choose a unique name for a generated pool entry.
+ *
+ * A readable identity can already be in use. Keep the readable base and add the
+ * first free numeric suffix (`name-2`, `name-3`, ...) rather than silently
+ * replacing or skipping the generated name.
+ */
+export function uniquePoolEntryName(
+	base: string,
+	existingNames: readonly string[],
+): { name: string; adjusted: boolean } {
+	const wanted = base.trim() || "entry";
+	const taken = new Set(existingNames);
+	if (!taken.has(wanted)) return { name: wanted, adjusted: false };
+	let suffix = 2;
+	while (taken.has(`${wanted}-${suffix}`)) suffix += 1;
+	return { name: `${wanted}-${suffix}`, adjusted: true };
+}
+
+/**
+ * Add, update, or remove ONE entry of a pool, in place.
  *
  * This is what the guided `/keyrouter add` and `/keyrouter remove` commands
  * write through. Same safety rules as the other write-backs: only the pool's
@@ -437,13 +496,14 @@ export function writeBackStrategy(
  * The entry is written in the form the pool already uses: a `keys` pool gets
  * `{name, value}`, an `accounts` pool gets `{name, credential}`. A pool with
  * neither list is left alone — a command does not invent a pool that the
- * config file does not have.
+ * config file does not have. An `update` changes only the named entry's value
+ * or credential; an external `$ENV` / `${ENV}` / `@file` source is refused.
  *
  * @returns the number of pools updated (0 when there was nothing to do)
  */
 export function writeBackPoolEntry(
 	providerName: string,
-	action: "add" | "remove",
+	action: "add" | "update" | "remove",
 	entry: { name: string; value?: string; credential?: OAuthCredential },
 	home?: string,
 ): { updated: number } | { error: string } {
@@ -477,6 +537,32 @@ export function writeBackPoolEntry(
 			} else {
 				if (!entry.credential) continue;
 				list.push({ name: entry.name, credential: entry.credential });
+			}
+		} else if (action === "update") {
+			const item = list.find((candidate) => candidate?.name === entry.name);
+			if (!item) continue;
+			if (keys) {
+				if (typeof entry.value !== "string") continue;
+				if (typeof item.value !== "string") {
+					return { error: `entry "${entry.name}" in "${providerName}" has no inline value to update` };
+				}
+				const reference = externalPoolReference(item.value);
+				if (reference) {
+					return { error: externalReferenceError(providerName, entry.name, "value", reference) };
+				}
+				if (item.value === entry.value) continue;
+				item.value = entry.value;
+			} else {
+				if (!entry.credential) continue;
+				const reference = externalPoolReference(item.credential);
+				if (reference) {
+					return { error: externalReferenceError(providerName, entry.name, "credential", reference) };
+				}
+				if (typeof item.credential !== "object" || item.credential === null || Array.isArray(item.credential)) {
+					return { error: `entry "${entry.name}" in "${providerName}" has no inline credential to update` };
+				}
+				if (JSON.stringify(item.credential) === JSON.stringify(entry.credential)) continue;
+				item.credential = entry.credential;
 			}
 		} else {
 			const index = list.findIndex((item) => item?.name === entry.name);

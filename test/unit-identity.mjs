@@ -264,6 +264,25 @@ const userPath = attributeCredential({
 check("the user's identityPath is tried before detection", userPath.kind === "match" && userPath.name === "slot-1");
 check("and is reported as the user's path", userPath.kind === "match" && userPath.source === "user-path");
 
+// `/keyrouter add` must find the account by identity even when pi refreshed
+// the access and refresh tokens. The configured path is authoritative.
+const sameAccountDifferentTokens = attributeCredential({
+	credential: cred({ accountId: "acct-123", access: "new-access", refresh: "new-refresh" }),
+	states: [{ name: "same-account", credential: cred({ accountId: "acct-123", access: "old-access", refresh: "old-refresh" }) }],
+	activeName: undefined,
+	expectedName: undefined,
+	installedByUs: false,
+	identityPath: "accountId",
+});
+check(
+	"a unique configured identity match survives token rotation",
+	sameAccountDifferentTokens.kind === "match" && sameAccountDifferentTokens.name === "same-account",
+);
+check(
+	"the configured identity match is attributed to the user's path",
+	sameAccountDifferentTokens.kind === "match" && sameAccountDifferentTokens.source === "user-path",
+);
+
 // Two slots sharing an identity, with nothing to separate them.
 const twins = [slot("twin-a", cred({ access: jwt({ email: "same@x.y" }), refresh: "RA" })), slot("twin-b", cred({ access: jwt({ email: "same@x.y" }), refresh: "RB" }))];
 const ambiguous = attributeCredential({
