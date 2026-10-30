@@ -20,6 +20,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-10-30
+
+### Fixed
+
+- `/keyrouter reset` now tells you that pi is using its own credentials again until the next session, and that keyrouter stays off until you call `/keyrouter reload` (or start a new session).
+
 ## [1.6.0] — 2026-10-30
 
 ### Added
@@ -523,7 +529,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.3.3...v1.4.0

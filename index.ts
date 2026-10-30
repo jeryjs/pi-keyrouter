@@ -1762,7 +1762,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				activationNotified = false;
 				ctx.ui.notify(
 					runtimes.size > 0
-						? "🔑 keyrouter: overrides cleared — pi is using your own credentials again."
+						? "🔑 keyrouter: overrides cleared — pi is using your own credentials again. keyrouter stays off until you call /keyrouter reload (or start a new session)."
 						: "🔑 keyrouter: nothing to reset (not active).",
 					"info",
 				);
