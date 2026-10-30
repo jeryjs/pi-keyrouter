@@ -40,8 +40,15 @@ const {
 // Importing index.ts binds no pi APIs at module scope (the extension only
 // registers handlers inside its default export), so the pure command parser is
 // reachable from a plain Node process.
-const { parseCommandArgs, commandCompletions, SUBCOMMANDS, alreadyUsingMessage, planOAuthAddition } =
-	await import("../index.ts");
+const {
+	parseCommandArgs,
+	commandCompletions,
+	commandHelpText,
+	COMMAND_DESCRIPTION,
+	SUBCOMMANDS,
+	alreadyUsingMessage,
+	planOAuthAddition,
+} = await import("../index.ts");
 
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -396,18 +403,27 @@ check(
 );
 
 const bare = parseCommandArgs("");
-check("a bare /keyrouter defaults to status", bare.sub === "status" && bare.args.length === 0);
+check("a bare /keyrouter requests help", bare.sub === "help" && bare.args.length === 0);
 check("a bare /keyrouter reports no operands, not an error", bare.args.join() === "");
-check("whitespace-only args default to status", parseCommandArgs("   ").sub === "status");
-check("a missing arg string does not throw", parseCommandArgs(undefined).sub === "status");
+check("whitespace-only args request help", parseCommandArgs("   ").sub === "help");
+check("a missing arg string does not throw", parseCommandArgs(undefined).sub === "help");
+check("--help requests help", parseCommandArgs("--help").sub === "help");
+check("--help is case-insensitive", parseCommandArgs("--HELP").sub === "help");
+const wordHelp = parseCommandArgs("help");
+check(
+	"the word help is not a recognized subcommand",
+	wordHelp.sub === "status" && wordHelp.args[0] === "help",
+);
+check("help is absent from the completion subcommands", !SUBCOMMANDS.includes("help"));
 
 check("explicit status", parseCommandArgs("status").sub === "status");
 check("reload", parseCommandArgs("reload").sub === "reload");
 check("reset", parseCommandArgs("reset").sub === "reset");
 check("subcommand is case-insensitive", parseCommandArgs("STATUS").sub === "status");
 check("surrounding whitespace is tolerated", parseCommandArgs("  reload  ").sub === "reload");
-check("an unknown word falls back to status", parseCommandArgs("bogus").sub === "status");
-check("an unknown word is NOT treated as an operand", parseCommandArgs("bogus").args.length === 0);
+check("an unknown word becomes a status provider operand", parseCommandArgs("bogus").sub === "status");
+check("an unknown word is retained for a clear provider error", parseCommandArgs("bogus").args[0] === "bogus");
+check("status parses an optional provider", parseCommandArgs("status cline").args[0] === "cline");
 
 const acct = parseCommandArgs("account cline");
 check("account parses its provider", acct.sub === "account" && acct.args[0] === "cline");
@@ -425,13 +441,13 @@ check(
 	parseCommandArgs("account CLINE Work").args.join(",") === "CLINE,Work",
 );
 check("only the first two operands are meaningful", parseCommandArgs("account a b c").args.length === 3);
-check("status takes no operands, usage is just the subcommand", parseCommandArgs("status").usage === "status");
+check("status usage shows its optional provider operand", parseCommandArgs("status").usage === "status [provider]");
 
 // add / remove: the guided credential-management commands.
 const addCmd = parseCommandArgs("add cline");
 check("add parses its provider", addCmd.sub === "add" && addCmd.args[0] === "cline");
 check("add with no name has just one operand", addCmd.args.length === 1);
-check("add usage is self-describing", /add <provider>/.test(addCmd.usage));
+check("add usage is self-describing", addCmd.usage === "add <provider> [name]");
 check("add accepts a name", parseCommandArgs("add cline work").args[1] === "work");
 check("add is case-insensitive", parseCommandArgs("ADD cline").sub === "add");
 const removeCmd = parseCommandArgs("remove cline work");
@@ -439,6 +455,17 @@ check("remove parses provider + name", removeCmd.sub === "remove" && removeCmd.a
 check("remove accepts an ordinal", parseCommandArgs("remove cline 2").args[1] === "2");
 check("remove usage is self-describing", /remove <provider>/.test(removeCmd.usage));
 check("remove is case-insensitive", parseCommandArgs("REMOVE cline").sub === "remove");
+
+const helpText = commandHelpText();
+check("help lists the filtered status form", helpText.includes("/keyrouter status [provider]"));
+check("help lists the add form with an optional name", helpText.includes("/keyrouter add <provider> [name]"));
+check("help does not invent a key operand", !helpText.includes("/keyrouter add <provider> [name] [key]"));
+check("help explains that key input is interactive", helpText.includes("entered interactively"));
+check(
+	"the command description exposes the operand syntax",
+	COMMAND_DESCRIPTION.includes("/keyrouter status [provider]") &&
+		COMMAND_DESCRIPTION.includes("/keyrouter add <provider> [name]"),
+);
 
 check(
 	"the already-using refusal has the exact required wording",
@@ -529,10 +556,19 @@ const POOLS = [
 	{
 		name: "cline",
 		kind: "oauth",
-		accounts: [{ name: "work" }, { name: "home" }, { name: "work-laptop" }],
+		accounts: [
+			{ name: "work", credential: { type: "oauth", access: "oauth-secret" } },
+			{ name: "home" },
+			{ name: "work-laptop" },
+		],
 		active: "home",
 	},
-	{ name: "tokenharbor", kind: "keys", keys: [{ name: "primary" }, { name: "backup" }], active: "primary" },
+	{
+		name: "tokenharbor",
+		kind: "keys",
+		keys: [{ name: "primary", value: "key-secret" }, { name: "backup" }],
+		active: "primary",
+	},
 ];
 const compl = (prefix) => commandCompletions(prefix, POOLS);
 const labels = (prefix) => (compl(prefix) ?? []).map((item) => item.label);
@@ -548,8 +584,9 @@ check("a subcommand suggestion carries a trailing space", compl("st")[0].value =
 check("subcommands carry a description", /pool state/.test(compl("")[0].description ?? ""));
 check("no matching subcommand yields null", compl("zzz") === null);
 
-// After a subcommand, only `account` and `strategy` take operands.
-check("a bare subcommand stops suggesting", compl("status ") === null);
+// After a subcommand, only the commands with operands keep suggesting.
+check("status offers provider filters", compl("status ").map((i) => i.label).join() === "cline,tokenharbor");
+check("status stops after the provider", compl("status cline ") === null);
 check("a chosen subcommand offers its pools", compl("account ").map((i) => i.label).join() === "cline,tokenharbor");
 check("reload takes no operands", compl("reload ") === null);
 check("reset takes no operands", compl("reset x") === null);
@@ -563,7 +600,23 @@ check("an unknown pool yields null", compl("account nope") === null);
 
 // Entries, for either pool kind.
 check("add offers the pool names", compl("add ").map((i) => i.label).join() === "cline,tokenharbor");
-check("add stops after the pool (the new name is free-form)", compl("add cline ") === null);
+check(
+	"add offers existing account names",
+	compl("add cline ").map((i) => i.label).join() === "work,home,work-laptop",
+);
+check(
+	"add offers existing key names",
+	compl("add tokenharbor ").map((i) => i.label).join() === "primary,backup",
+);
+check(
+	"an add suggestion carries the whole line",
+	compl("add cline wo").find((i) => i.label === "work").value === "add cline work",
+);
+check(
+	"add completions never expose credential values",
+	!JSON.stringify(compl("add cline ")).includes("oauth-secret") &&
+		!JSON.stringify(compl("add tokenharbor ")).includes("key-secret"),
+);
 check(
 	"remove offers the pool's entries",
 	compl("remove cline ").map((i) => i.label).join() === "work,home,work-laptop",

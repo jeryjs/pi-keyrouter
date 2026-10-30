@@ -1645,18 +1645,54 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("keyrouter", {
-		description: "manage credential pools (status, reload, reset, account, strategy, add, remove)",
+		description: COMMAND_DESCRIPTION,
 		getArgumentCompletions: (prefix) =>
 			commandCompletions(prefix, config?.providers ?? loadConfig().providers),
 		handler: async (args, ctx) => {
 			const parsed = parseCommandArgs(args);
 			const sub = parsed.sub;
+			if (sub === "help") {
+				// Help is strictly observational. In particular, do not fall through
+				// to status: status may activate the pools, while a help request must
+				// not touch credentials or keyrouter.json.
+				ctx.ui.notify(commandHelpText(), "info");
+				return;
+			}
 			if (sub === "status") {
-				// On-demand activation in case session_start/before_agent_start
-				// haven't fired yet (e.g. user ran /keyrouter status right after
-				// /reload without sending a prompt).
+				const wanted = parsed.args[0];
+				let statusProviderId: string | undefined;
+				let statusPoolName: string | undefined;
+				if (wanted) {
+					// Validate the provider against the config before activation so an
+					// unknown operand fails clearly and non-destructively.
+					if (!config) config = loadConfig(ctx.cwd);
+					const found = findPool(ctx, config, wanted);
+					if (!found) {
+						const names = (config?.providers ?? []).map((pool) => pool.name);
+						ctx.ui.notify(
+							`🔑 keyrouter: no provider named "${wanted}" in ${configPath()}. ` +
+								(names.length > 0
+									? `Pools: ${names.join(", ")}.`
+									: "No pools are configured."),
+							"warning",
+						);
+						return;
+					}
+					statusProviderId = found.providerId;
+					statusPoolName = found.pool.name;
+				}
+				// Use the same on-demand activation fallback as unfiltered status. This
+				// ensures a filtered view shows the normal runtime state even when
+				// session_start/before_agent_start have not fired yet.
 				if (!config || runtimes.size === 0) {
 					await activate(ctx);
+				}
+				if (statusProviderId && !runtimes.has(statusProviderId)) {
+					ctx.ui.notify(
+						`🔑 keyrouter: provider "${statusPoolName}" is configured but has no active runtime state.`,
+						"warning",
+					);
+					return;
 				}
 				if (!config || config.providers.length === 0) {
 					ctx.ui.notify(
@@ -1667,10 +1703,15 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				if (!credentialApi) {
-					ctx.ui.notify(
-						"🔑 keyrouter: runtime credential overrides unavailable in this pi build — inert.",
-						"warning",
-					);
+					// A filtered status may run before activation has probed the API.
+					// Probe it read-only so the warning below is accurate.
+					if (!credentialApiChecked) credentialsApi(ctx.modelRegistry, ctx.ui);
+					if (!credentialApi) {
+						ctx.ui.notify(
+							"🔑 keyrouter: runtime credential overrides unavailable in this pi build — inert.",
+							"warning",
+						);
+					}
 				}
 				// The reminder matters only when the level is not the default: it is the
 				// answer to "why do I no longer see rotation lines?".
@@ -1680,6 +1721,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						: "";
 				const lines: string[] = [`🔑 keyrouter: active${levelSuffix}`];
 				for (const [providerId, rt] of runtimes) {
+					if (statusProviderId && providerId !== statusProviderId) continue;
 					const current = rt.currentIndex >= 0 ? rt.keys[rt.currentIndex] : undefined;
 					// `source` is pi's own vocabulary (runtime / stored / environment).
 					// "runtime" is the only reliable signal that an api_key overlay is
@@ -2384,6 +2426,48 @@ export const SUBCOMMANDS = [
 	"remove",
 ] as const;
 
+/** One line of the full `/keyrouter` command help. */
+export const COMMAND_HELP = [
+	{
+		usage: "status [provider]",
+		description: "show live pool state, optionally filtered to one provider",
+	},
+	{ usage: "reload", description: "re-read the config file" },
+	{ usage: "reset", description: "hand providers back to pi's own credentials" },
+	{
+		usage: "account <provider> [name|index]",
+		description: "pin a specific key or account",
+	},
+	{
+		usage: "strategy <provider> [strategy]",
+		description: "show or set a pool's rotation strategy",
+	},
+	{
+		usage: "add <provider> [name]",
+		description:
+			"add or update a key/account; API key values are entered interactively",
+	},
+	{
+		usage: "remove <provider> <name|index>",
+		description: "remove a key or an account from a pool",
+	},
+] as const;
+
+/** Description shown for `/keyrouter` in pi's command autocomplete. */
+export const COMMAND_DESCRIPTION =
+	"manage credential pools — /keyrouter status [provider], /keyrouter reload, " +
+	"/keyrouter reset, /keyrouter account <provider> [name|index], " +
+	"/keyrouter strategy <provider> [strategy], /keyrouter add <provider> [name], " +
+	"/keyrouter remove <provider> <name|index]";
+
+/** The full command help shown by bare `/keyrouter` and `/keyrouter --help`. */
+export function commandHelpText(): string {
+	return [
+		"🔑 keyrouter: command help",
+		...COMMAND_HELP.map((entry) => `  /keyrouter ${entry.usage} — ${entry.description}`),
+	].join("\n");
+}
+
 /**
  * Parse `/keyrouter` arguments into a subcommand plus its operands.
  *
@@ -2391,46 +2475,52 @@ export const SUBCOMMANDS = [
  * slice commands cannot be driven from print mode, so this is what the test suite
  * can actually exercise (`test/unit-oauth.mjs`).
  *
- * `args` is the raw text after `/keyrouter`. Extra whitespace is collapsed, and
- * a missing or unrecognised subcommand falls back to `status` — the friendly
- * default for a bare `/keyrouter`.
+ * `args` is the raw text after `/keyrouter`. Extra whitespace is collapsed. A
+ * bare command and `--help` request the help list; an unrecognised word is
+ * treated as a `status` provider operand so the handler can report that the
+ * provider does not exist instead of silently showing every pool.
  */
 export function parseCommandArgs(args: string): {
 	sub: string;
-	/** Operands after the subcommand: [provider, entryName?] for `account`,
-	 * [provider, strategy?] for `strategy`. */
+	/** Operands after the subcommand: [provider?] for `status`,
+	 * [provider, entryName?] for `account`, [provider, strategy?] for `strategy`,
+	 * and [provider, entryName?] for `add`. */
 	args: string[];
 	/** The exact `/keyrouter …` form to show the user for this subcommand. */
 	usage: string;
 } {
 	const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
 	const first = tokens[0]?.toLowerCase() ?? "";
-	const sub = (SUBCOMMANDS as readonly string[]).includes(first) ? first : "status";
-	// A bare `/keyrouter` or an unknown word behaves as `status` with no operands:
-	// the unknown word was a subcommand guess, not an argument.
-	const rest = (SUBCOMMANDS as readonly string[]).includes(first) ? tokens.slice(1) : [];
+	if (!first || first === "--help") {
+		return { sub: "help", args: [], usage: "help" };
+	}
+	const known = (SUBCOMMANDS as readonly string[]).includes(first);
+	const sub = known ? first : "status";
+	const rest = known ? tokens.slice(1) : tokens;
 	const usage =
-		sub === "account"
-			? "account <provider> [name|index]"
-			: sub === "strategy"
-				? "strategy <provider> [strategy]"
-				: sub === "add"
-					? "add <provider> [name]"
-					: sub === "remove"
-						? "remove <provider> <name|index>"
-						: sub;
+		sub === "status"
+			? "status [provider]"
+			: sub === "account"
+				? "account <provider> [name|index]"
+				: sub === "strategy"
+					? "strategy <provider> [strategy]"
+					: sub === "add"
+						? "add <provider> [name]"
+						: sub === "remove"
+							? "remove <provider> <name|index>"
+							: sub;
 	return { sub, args: rest, usage };
 }
 
 /** Descriptions shown next to each subcommand in the completion menu. */
 const SUBCOMMAND_DESCRIPTIONS: Record<string, string> = {
-	status: "live pool state per provider",
-	reload: "re-read the config file",
-	reset: "hand providers back to pi's own credentials",
-	account: "pin a specific key or account",
-	strategy: "show or set a pool's rotation strategy",
-	add: "add a key or an account to a pool",
-	remove: "remove a key or an account from a pool",
+	status: "[provider] — show live pool state, optionally filtered",
+	reload: "reload — re-read the config file",
+	reset: "reset — hand providers back to pi's own credentials",
+	account: "<provider> [name|index] — pin a specific key or account",
+	strategy: "<provider> [strategy] — show or set a pool's rotation strategy",
+	add: "<provider> [name] — add/update a key or account; key input is interactive",
+	remove: "<provider> <name|index> — remove a key or an account from a pool",
 };
 
 /** Descriptions shown next to each strategy value in the completion menu. */
@@ -2482,10 +2572,18 @@ export function commandCompletions(
 
 	// Only these take operands; the rest are complete on their own.
 	const sub = done[0]?.toLowerCase();
-	if (sub !== "account" && sub !== "strategy" && sub !== "add" && sub !== "remove") return null;
+	if (
+		sub !== "status" &&
+		sub !== "account" &&
+		sub !== "strategy" &&
+		sub !== "add" &&
+		sub !== "remove"
+	) {
+		return null;
+	}
 	if (done.length > 2) return null;
 
-	// First operand, shared by both: the pool names.
+	// First operand, shared by all of them: the pool names.
 	if (done.length === 1) {
 		return items(
 			pools
@@ -2501,6 +2599,8 @@ export function commandCompletions(
 	// Second operand, once the pool is named.
 	const pool = pools.find((candidate) => candidate.name === done[1]);
 	if (!pool) return null;
+
+	if (sub === "status") return null;
 
 	if (sub === "strategy") {
 		// `stalest-first` is not offered for a keys pool: it orders by token
@@ -2518,10 +2618,8 @@ export function commandCompletions(
 		);
 	}
 
-	// `add` takes a free-form name, so there is nothing to suggest.
-	if (sub === "add") return null;
-
-	// `account` and `remove`: the entries of the pool named in `done[1]`.
+	// `add`, `account`, and `remove`: the entries of the pool named in
+	// `done[1]`. Only names are exposed — never key values or credential blobs.
 	const entries = pool.kind === "oauth" ? (pool.accounts ?? []) : (pool.keys ?? []);
 	return items(
 		entries
@@ -2531,7 +2629,14 @@ export function commandCompletions(
 			.map((entry) => ({
 				value: `${sub} ${pool.name} ${entry.name}`,
 				label: entry.name,
-				description: pool.active === entry.name ? "active" : undefined,
+				description:
+					sub === "add"
+						? pool.kind === "oauth"
+							? "existing account"
+							: "existing key"
+						: pool.active === entry.name
+							? "active"
+							: undefined,
 			})),
 	);
 }
