@@ -20,6 +20,42 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/keyrouter notifications [all|quiet|silent]` — show or set the notification level without
+  hand-editing `~/.pi/keyrouter.json`.** With no operand it reports the current level and what it
+  means; with a level it writes the top-level `notifications` field and applies it to the running
+  session immediately, so no `/reload` is needed. An unknown level is refused with the list of
+  valid ones and writes nothing.
+
+- **`/keyrouter status [provider]` — the status view, optionally narrowed to one pool.** Naming a
+  provider shows just that pool in the usual format; an unknown provider is refused with the list
+  of configured pools, and nothing is changed.
+
+- **Bare `/keyrouter` and `/keyrouter --help` print the full command list** with every command's
+  operand syntax, so the commands are discoverable without memorizing them. A help request is
+  strictly observational — it never activates the pools or touches credentials.
+
+- **Account additions are identity-aware.** For an `accounts` pool, `/keyrouter add <provider>`
+  now recognizes pi's current login by the account's *identity* — the provider's `identityPath`, or
+  the identity claims a token carries — instead of only comparing the bytes of the credential: a
+  token that was refreshed since the pool entry was written is still the same account. When the
+  login matches an entry, the command asks whether to update that entry, add the login as a new
+  account, or cancel; an ambiguous match (two entries claiming one identity) is refused and asks for
+  an explicit name or an `identityPath`.
+
+### Changed
+
+- **`/keyrouter add <provider> <name>` updates an existing entry in place**, for both pool kinds:
+  a `keys` entry gets the new key value, an `accounts` entry gets the credential pi holds right now.
+  When the named entry holds a different account identity, the replacement is confirmed first. An
+  entry backed by an external source (`$ENV`, `${ENV}` or `@file`) is not edited in place — the
+  command points at the environment variable or file instead. A generated name that is already taken
+  gets a numbered suffix and a note; a name you typed yourself is kept as typed.
+
+- **The completion menu offers the pool's entries after `add`**, since an existing name is now an
+  update target, and offers `all`, `quiet` and `silent` after `notifications`.
+
 ## [1.6.1] — 2026-10-30
 
 ### Fixed

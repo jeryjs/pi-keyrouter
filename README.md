@@ -424,23 +424,28 @@ error, rather than leaving you logged out.
 ## Commands
 
 ```
-/keyrouter status    live pool state per provider (kind, active entry, install state, expiry)
+/keyrouter status [provider]    live pool state per provider (kind, active entry, install state, expiry)
 /keyrouter reload     re-read ~/.pi/keyrouter.json
 /keyrouter reset      hand providers back to pi's own credentials immediately
 /keyrouter account <provider> [name|index]    pin a specific key or account
 /keyrouter strategy <provider> [strategy]    show or set a pool's rotation strategy
-/keyrouter add <provider> [name]    add a key or an account to a pool
+/keyrouter add <provider> [name]    add a key or an account to a pool, or update the named entry
 /keyrouter remove <provider> <name|index>    remove a key or an account from a pool
+/keyrouter notifications [all|quiet|silent]    show or set how much keyrouter notifies you
 ```
+
+`/keyrouter` on its own — or `/keyrouter --help` — prints this list with every command's syntax, so
+nothing has to be memorized or looked up.
 
 `reset` also clears each pool's saved `active` position, so the next session starts at the first
 entry rather than resuming onto the credential you just handed back.
 
 The completion menu fills the rest in: the subcommands first, then the configured pools after
-`account`, `strategy`, `add` or `remove`, then that pool's entries for `account` and `remove`, or
-the strategy values valid for that pool's kind for `strategy`. Entry names are matched case-insensitively, and the pool's
-current `active` entry is labelled as such. Suggestions stop as soon as the command is complete, so
-`status` and `reload` never offer operands.
+`status`, `account`, `strategy`, `add` or `remove`, then that pool's entries for `account`,
+`remove` and `add` — an existing name is an update target — or the strategy values valid for that
+pool's kind for `strategy`. After `notifications` it offers `all`, `quiet` and `silent`. Entry names
+are matched case-insensitively, and the pool's current `active` entry is labelled as such.
+Suggestions stop as soon as the command is complete, so `reload` never offers operands.
 
 `account` switches a pool to a specific credential, and works for either pool kind. It accepts an
 exact name, a case-insensitive name, or a 1-based index. With no name it reports the pool and the
@@ -486,6 +491,8 @@ other than `failover` also shows up in `/keyrouter status` next to the pool's `s
 /keyrouter add tokenharbor backup      → prompts for the key, then:
                                          added backup to tokenharbor. It joins the pool on the next turn.
 /keyrouter add tokenharbor              → the name defaults to key-3
+/keyrouter add tokenharbor old         → "old" is already in the pool: prompts for the key, then:
+                                         updated old in tokenharbor.
 /keyrouter add cline                   → captures the account pi is holding (run /login first)
 /keyrouter remove tokenharbor backup    → confirms, then:
                                          removed backup from tokenharbor.
@@ -495,15 +502,34 @@ other than `failover` also shows up in `/keyrouter status` next to the pool's `s
 runs a login of its own. (pi's prompt is a plain text field, not a masked one, so the key is
 visible while you type it.) For an `accounts` pool it captures the credential **pi** is holding right
 now, so the flow stays pi's own: `/login` first, then `/keyrouter add <provider>`. If pi is already
-holding one of the pool's accounts, the command says so rather than adding the same credential
-twice.
+holding one of the pool's accounts, the command says so — and tells you to `/login` another account
+first — rather than adding the same credential twice.
+
+**Adding knows who you are.** For an `accounts` pool the match is made on the account's *identity*
+— the provider's `identityPath`, or the identity claims a token carries (see
+[Attributing a refreshed credential](#attributing-a-refreshed-credential)) — not on the bytes of
+the credential: a token that was refreshed since the pool entry was written is still the same
+account. When pi's current login matches an entry, `/keyrouter add` asks what to do: update that
+entry, add the login as a new account, or cancel. If the match is ambiguous (two entries claim the
+same identity), the command refuses and asks you to name the account or to set `identityPath` for
+that provider.
+
+**A name that already exists is an update.** `/keyrouter add <provider> <name>` where `<name>` is
+already in the pool updates that entry **in place**, for both pool kinds. On a `keys` pool it
+replaces the key value; on an `accounts` pool it replaces the stored credential with the one pi
+holds right now. If the named entry holds a *different* account identity, keyrouter asks for
+confirmation before replacing it. An entry whose value comes from an external source (`$ENV`,
+`${ENV}` or `@file`) is **not** edited in place — the command points you at the environment variable
+or the file instead, because that value is yours to maintain. A generated name that is already taken
+gets a numbered suffix (`key-2`, `key-3`, …) and a note; a name you typed yourself is kept as typed.
 
 `remove` deletes the entry from the file after a confirmation, and forgets the pool's `active`
 position when that was the entry removed. pi's own login is never touched.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and
-cooldown. Counters and cooldowns are per-session; only the active position carries over, via the
+cooldown. Naming a provider — `/keyrouter status cline` — shows just that pool, in the same format.
+Counters and cooldowns are per-session; only the active position carries over, via the
 `active` field. For `accounts` pools it also shows how long the credential has left — never the
 token:
 
@@ -525,7 +551,9 @@ that reaches you — `"all"` (default), `"quiet"`, or `"silent"`:
 
 Pool exhaustion is never silenced: hiding the one event where the request dies would only make the
 provider's own error look unexplained. `/keyrouter status` names the active level whenever it is not
-the default. In headless/print mode there is
+the default, and `/keyrouter notifications` shows it on its own: `/keyrouter notifications quiet`
+sets the level, writes it to `~/.pi/keyrouter.json` and applies it to the running session right
+away — no hand-editing of the file, and no `/reload` needed. In headless/print mode there is
 no UI, so set `PI_KEYROUTER_TRACE=<file>` to log decisions (credential **names** only, never values) —
 the trace records every decision regardless of the level:
 
