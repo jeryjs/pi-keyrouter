@@ -1072,7 +1072,16 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 // ---------------------------------------------------------------------------
 const leaseHome = mkdtempSync(join(tmpdir(), "kr-unit-lease-"));
 try {
-	const { claimLease, releaseLease, leasedByOthers, leaseOwner } = await import("../lease.ts");
+	const {
+		claimLease,
+		claimSweepLease,
+		releaseLease,
+		releaseOwnLeases,
+		releaseSweepLease,
+		leasedByOthers,
+		leaseOwner,
+		sweepLeaseOwner,
+	} = await import("../lease.ts");
 	// The leases live next to the config file, so a test points them at a
 	// throwaway config rather than at the user's own ~/.pi.
 	const leaseConfig = join(leaseHome, "keyrouter.json");
@@ -1115,6 +1124,47 @@ try {
 		"without leases the preferred entry still wins",
 		pickNextKey(leasedStates, 0, Date.now()) === 0,
 	);
+
+	// Provider-wide sweep claims are separate from entry leases: they guard a
+	// whole OAuth provider while its idle accounts are refreshed.
+	check("a fresh provider sweep claim is free", sweepLeaseOwner("sweep-provider", leaseConfig) === undefined);
+	check("claiming a provider sweep succeeds", claimSweepLease("sweep-provider", leaseConfig) === true);
+	check("the provider sweep claim is ours", sweepLeaseOwner("sweep-provider", leaseConfig) === process.pid);
+	check("claiming a provider sweep twice is still ours", claimSweepLease("sweep-provider", leaseConfig) === true);
+	releaseSweepLease("sweep-provider", leaseConfig);
+	check("releasing frees the provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === undefined);
+
+	// Another LIVE process holds the provider sweep: it is visible, but cannot
+	// be taken or stolen by release.
+	writeFileSync(join(leaseDir, "sweep-provider.sweep-lease"), `${process.ppid}\n`, "utf8");
+	check("another live process holds the provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === process.ppid);
+	check("a held provider sweep cannot be claimed", claimSweepLease("sweep-provider", leaseConfig) === false);
+	releaseSweepLease("sweep-provider", leaseConfig);
+	check("releasing never steals another process's provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === process.ppid);
+
+	// A DEAD process's provider sweep is stale and may be taken over.
+	writeFileSync(join(leaseDir, "dead-sweep.sweep-lease"), "999999999\n", "utf8");
+	check("a dead owner's provider sweep is stale", sweepLeaseOwner("dead-sweep", leaseConfig) === undefined);
+	check("a stale provider sweep can be taken over", claimSweepLease("dead-sweep", leaseConfig) === true);
+	check("the taken-over provider sweep is ours", sweepLeaseOwner("dead-sweep", leaseConfig) === process.pid);
+	releaseSweepLease("dead-sweep", leaseConfig);
+
+	// Sweep claims must not leak into the API-key entry-lease API.
+	check("claiming a provider sweep succeeds independently", claimSweepLease("sweep-only", leaseConfig) === true);
+	check("a provider sweep is not an entry lease", leasedByOthers("sweep-only", 3, leaseConfig).size === 0);
+	check("a provider sweep has no entry owner", leaseOwner("sweep-only", 0, leaseConfig) === undefined);
+
+	// Clean shutdown releases this process's provider sweep too.
+	claimSweepLease("cleanup-sweep", leaseConfig);
+	releaseOwnLeases(leaseConfig);
+	check("own-claims cleanup removes this process's provider sweep", sweepLeaseOwner("cleanup-sweep", leaseConfig) === undefined);
+
+	// A sweep that is STILL RUNNING keeps its claim: releasing it early would
+	// let another session sweep the same provider in parallel.
+	claimSweepLease("running-sweep", leaseConfig);
+	releaseOwnLeases(leaseConfig, new Set(["running-sweep"]));
+	check("cleanup keeps the claim of a running sweep", sweepLeaseOwner("running-sweep", leaseConfig) === process.pid);
+	releaseSweepLease("running-sweep", leaseConfig);
 } finally {
 	rmSync(leaseHome, { recursive: true, force: true });
 }

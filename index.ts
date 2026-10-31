@@ -71,10 +71,12 @@ import {
 } from "./identity.ts";
 import {
 	claimLease,
+	claimSweepLease,
 	leaseOwner,
 	leasedByOthers,
 	releaseLease,
 	releaseOwnLeases,
+	releaseSweepLease,
 } from "./lease.ts";
 import {
 	initAccountStates,
@@ -1203,13 +1205,29 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			// refresh token each consume the other. Failure rotation cannot be
 			// blocked (a failing turn needs a replacement now); its narrower residual
 			// is handled inside the loop, right after the exchange.
-			sweepingProviders.add(rt.providerId);
+			//
+			// The provider-wide claim also serializes the sweep across sessions:
+			// another live session refreshing the same provider would consume the
+			// same rotating refresh token and race this process's whole-config
+			// write-back. A skipped provider is trace-only.
+			if (!claimSweepLease(rt.providerId)) {
+				trace(`sweep skip ${rt.providerId} (another session is sweeping it)`);
+				continue;
+			}
 			try {
+				sweepingProviders.add(rt.providerId);
 				for (const entry of rt.keys) {
 					if (entry === rt.keys[rt.currentIndex]) continue; // pi owns the active one
 					const credential = entry.credential;
 					if (!credential || typeof credential.expires !== "number") continue;
 					if (now + MIN_VALIDITY_MS < credential.expires) continue; // still has life
+					// Renew the provider claim as the sweep progresses. Re-claiming
+					// our own claim refreshes its timestamp; if it was taken over,
+					// stop before exchanging another refresh token.
+					if (!claimSweepLease(rt.providerId)) {
+						trace(`sweep stop ${rt.providerId} (sweep claim lost)`);
+						break;
+					}
 					try {
 						const fresh = await oauth.refresh(credential, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
 						if (!isOAuthCredential(fresh)) {
@@ -1251,6 +1269,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				}
 			} finally {
 				sweepingProviders.delete(rt.providerId);
+				releaseSweepLease(rt.providerId);
 			}
 		}
 	}
@@ -1641,9 +1660,11 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		injected.clear();
 		installedAccounts.clear();
 		// The lease claims belong to this process alone: release them so another
-		// pi process may use those entries.
+		// pi process may use those entries. A sweep that is still running keeps
+		// its provider claim — it releases it when it finishes, and releasing it
+		// here would let another session sweep the same provider in parallel.
 		releaseLeases();
-		releaseOwnLeases();
+		releaseOwnLeases(undefined, sweepingProviders);
 		runtimes.clear();
 		skipReported.clear();
 		permanentSkip.clear();
