@@ -290,7 +290,9 @@ export function writeBackCredentials(
 
 	// Atomic replace: write beside the target, then rename over it, so a crash
 		// mid-write cannot leave a truncated file holding live credentials.
-	const temp = `${file}.keyrouter.tmp`;
+	// The temp name carries the pid: two pi processes writing the same config
+	// must not share one temp file, or one of them renames the other's bytes.
+	const temp = `${file}.${process.pid}.keyrouter.tmp`;
 	const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
 	try {
 		fs.writeFileSync(temp, serialized, { encoding: "utf-8", mode: 0o600 });
@@ -355,7 +357,9 @@ export function writeBackActive(
 	}
 	if (updated === 0) return { updated: 0 };
 
-	const temp = `${file}.keyrouter.tmp`;
+	// The temp name carries the pid: two pi processes writing the same config
+	// must not share one temp file, or one of them renames the other's bytes.
+	const temp = `${file}.${process.pid}.keyrouter.tmp`;
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(temp, file);
@@ -414,7 +418,9 @@ export function writeBackStrategy(
 	}
 	if (updated === 0) return { updated: 0 };
 
-	const temp = `${file}.keyrouter.tmp`;
+	// The temp name carries the pid: two pi processes writing the same config
+	// must not share one temp file, or one of them renames the other's bytes.
+	const temp = `${file}.${process.pid}.keyrouter.tmp`;
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(temp, file);
@@ -467,7 +473,9 @@ export function writeBackNotifications(
 	if (parsed.notifications === level) return { updated: 0 };
 	parsed.notifications = level;
 
-	const temp = `${file}.keyrouter.tmp`;
+	// The temp name carries the pid: two pi processes writing the same config
+	// must not share one temp file, or one of them renames the other's bytes.
+	const temp = `${file}.${process.pid}.keyrouter.tmp`;
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(temp, file);
@@ -550,9 +558,9 @@ export function uniquePoolEntryName(
  *
  * This is what the guided `/keyrouter add` and `/keyrouter remove` commands
  * write through. Same safety rules as the other write-backs: only the pool's
- * own entry list changes, the rest of the file keeps its order and formatting,
- * the write is atomic, it is skipped when nothing changed, and a failure is
- * reported rather than thrown.
+ * own entry list changes, every other field keeps its value and its order (the
+ * file is written back as two-space JSON), the write is atomic, it is skipped
+ * when nothing changed, and a failure is reported rather than thrown.
  *
  * The entry is written in the form the pool already uses: a `keys` pool gets
  * `{name, value}`, an `accounts` pool gets `{name, credential}`. A pool with
@@ -648,7 +656,9 @@ export function writeBackPoolEntry(
 	}
 	if (updated === 0) return { updated: 0 };
 
-	const temp = `${file}.keyrouter.tmp`;
+	// The temp name carries the pid: two pi processes writing the same config
+	// must not share one temp file, or one of them renames the other's bytes.
+	const temp = `${file}.${process.pid}.keyrouter.tmp`;
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(temp, file);

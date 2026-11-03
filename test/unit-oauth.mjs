@@ -981,7 +981,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 
 	const failedNotificationsFile = join(persistDir, "failed-notifications.json");
 	writeFileSync(failedNotificationsFile, JSON.stringify(notificationSeed, null, 2) + "\n", "utf8");
-	const failedTemp = `${failedNotificationsFile}.keyrouter.tmp`;
+	const failedTemp = `${failedNotificationsFile}.${process.pid}.keyrouter.tmp`;
 	mkdirSync(failedTemp);
 	process.env.PI_KEYROUTER_CONFIG = failedNotificationsFile;
 	const failedNotifications = writeBackNotifications("quiet");
