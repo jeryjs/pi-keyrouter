@@ -1230,27 +1230,48 @@ try {
 	const leaseConfig = join(leaseHome, "keyrouter.json");
 	const leaseDir = join(leaseHome, "keyrouter-leases");
 
-	check("a fresh entry is free", leaseOwner("p", 0, leaseConfig) === undefined);
-	check("claiming succeeds", claimLease("p", 0, leaseConfig) === true);
-	check("the claim is ours", leaseOwner("p", 0, leaseConfig) === process.pid);
-	check("claiming twice is still ours", claimLease("p", 0, leaseConfig) === true);
-	check("our own claim is not another process", !leasedByOthers("p", 3, leaseConfig).has(0));
-	releaseLease("p", 0, leaseConfig);
-	check("releasing frees the entry", leaseOwner("p", 0, leaseConfig) === undefined);
+	check("a fresh entry is free", leaseOwner("p", "k0", leaseConfig) === undefined);
+	check("claiming succeeds", claimLease("p", "k0", leaseConfig) === true);
+	check("the claim is ours", leaseOwner("p", "k0", leaseConfig) === process.pid);
+	check("claiming twice is still ours", claimLease("p", "k0", leaseConfig) === true);
+	check(
+		"our own claim is not another process",
+		!leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(0),
+	);
+	releaseLease("p", "k0", leaseConfig);
+	check("releasing frees the entry", leaseOwner("p", "k0", leaseConfig) === undefined);
 
 	// Another LIVE process holds the entry: it must be invisible to us to take,
 	// and visible to the picker.
 	mkdirSync(leaseDir, { recursive: true });
-	writeFileSync(join(leaseDir, "p.1.lease"), `${process.ppid}\n`, "utf8");
-	check("another live process holds the entry", leasedByOthers("p", 3, leaseConfig).has(1));
-	check("a held entry cannot be claimed", claimLease("p", 1, leaseConfig) === false);
-	check("releasing never steals somebody else's claim", (releaseLease("p", 1, leaseConfig), leaseOwner("p", 1, leaseConfig) === process.ppid));
+	writeFileSync(join(leaseDir, "p.k1.lease"), `${process.ppid}\n`, "utf8");
+	check(
+		"another live process holds the entry",
+		leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(1),
+	);
+	check("a held entry cannot be claimed", claimLease("p", "k1", leaseConfig) === false);
+	check(
+		"releasing never steals somebody else's claim",
+		(releaseLease("p", "k1", leaseConfig), leaseOwner("p", "k1", leaseConfig) === process.ppid),
+	);
 
 	// A DEAD process's claim is stale and may be taken over.
-	writeFileSync(join(leaseDir, "p.2.lease"), "999999999\n", "utf8");
-	check("a dead owner's claim is stale", !leasedByOthers("p", 3, leaseConfig).has(2));
-	check("a stale claim can be taken over", claimLease("p", 2, leaseConfig) === true);
-	check("the taken-over claim is ours", leaseOwner("p", 2, leaseConfig) === process.pid);
+	writeFileSync(join(leaseDir, "p.k2.lease"), "999999999\n", "utf8");
+	check(
+		"a dead owner's claim is stale",
+		!leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(2),
+	);
+	check("a stale claim can be taken over", claimLease("p", "k2", leaseConfig) === true);
+	check("the taken-over claim is ours", leaseOwner("p", "k2", leaseConfig) === process.pid);
+
+	// A claim belongs to the ENTRY, not to its position. Removing an entry from
+	// the pool shifts every later index, and an index-keyed claim would then
+	// protect the wrong credential — or none at all.
+	const shifted = leasedByOthers("p", ["k1", "k2"], leaseConfig);
+	check(
+		"a claim follows its entry when the pool shifts",
+		shifted.has(0) && !shifted.has(1),
+	);
 
 	// The selection half: a leased entry is skipped, but a lease never
 	// deadlocks the picker.

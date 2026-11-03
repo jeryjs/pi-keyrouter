@@ -97,8 +97,8 @@ function safeName(value: string): string {
 }
 
 /** The file that holds the claim for one pool entry. */
-function leaseFile(providerId: string, index: number, configFile?: string): string {
-	return path.join(leaseDir(configFile), `${safeName(providerId)}.${index}.lease`);
+function leaseFile(providerId: string, entryName: string, configFile?: string): string {
+	return path.join(leaseDir(configFile), `${safeName(providerId)}.${safeName(entryName)}.lease`);
 }
 
 /** The file that holds the provider-wide sweep claim. */
@@ -143,13 +143,18 @@ function isStale(file: string, owner: number | undefined, ttlMs = LEASE_TTL_MS):
 /**
  * Claim one pool entry for this process.
  *
+ * The claim is named after the ENTRY, not its position: a pool is a list the
+ * user edits, and removing an entry shifts every later index. An index-keyed
+ * claim would then protect a different credential than the one it was taken
+ * for — or none at all.
+ *
  * Returns true when this process holds the claim afterwards — either because
  * it created it, or because it already held it. False means another live
  * process owns the entry; the caller may still use it (a lease must never
  * block a request), but it should prefer a different one.
  */
-export function claimLease(providerId: string, index: number, configFile?: string): boolean {
-	const file = leaseFile(providerId, index, configFile);
+export function claimLease(providerId: string, entryName: string, configFile?: string): boolean {
+	const file = leaseFile(providerId, entryName, configFile);
 	const payload = `${process.pid}\n`;
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -194,9 +199,8 @@ export function claimLease(providerId: string, index: number, configFile?: strin
  * A claim owned by another process is never removed: releasing must not steal
  * somebody else's entry.
  */
-export function releaseLease(providerId: string, index: number, configFile?: string): void {
-	if (index < 0) return;
-	const file = leaseFile(providerId, index, configFile);
+export function releaseLease(providerId: string, entryName: string, configFile?: string): void {
+	const file = leaseFile(providerId, entryName, configFile);
 	const owner = readOwner(file);
 	if (owner !== undefined && owner !== process.pid) return;
 	try {
@@ -328,24 +332,42 @@ export function releaseOwnLeases(configFile?: string, keepSweepProviders?: Reado
  */
 export function leasedByOthers(
 	providerId: string,
-	count: number,
+	entryNames: readonly string[],
 	configFile?: string,
 ): Set<number> {
 	const leased = new Set<number>();
 	const dir = leaseDir(configFile);
-	let names: string[];
+	// The claim file of every entry of this pool, mapped to its position. The
+	// claim is named after the ENTRY, so a pool edit cannot detach it.
+	const wanted = new Map<string, number>();
+	entryNames.forEach((entryName, index) => {
+		wanted.set(path.basename(leaseFile(providerId, entryName, configFile)), index);
+	});
+	let files: string[];
 	try {
-		names = fs.readdirSync(dir);
+		files = fs.readdirSync(dir);
 	} catch {
 		return leased;
 	}
 	const prefix = `${safeName(providerId)}.`;
-	for (const name of names) {
+	for (const name of files) {
 		if (!name.startsWith(prefix) || !name.endsWith(".lease")) continue;
-		const index = Number(name.slice(prefix.length, -".lease".length));
-		if (!Number.isInteger(index) || index < 0 || index >= count) continue;
 		const file = path.join(dir, name);
 		const owner = readOwner(file);
+		const index = wanted.get(name);
+		if (index === undefined) {
+			// A claim for an entry that is no longer in the pool. It can never be
+			// released by its owner once that process is gone, so a stale one is
+			// cleaned up here; a live one is left alone.
+			if (owner !== undefined && owner !== process.pid && isStale(file, owner)) {
+				try {
+					fs.rmSync(file, { force: true });
+				} catch {
+					// Best effort.
+				}
+			}
+			continue;
+		}
 		if (owner === process.pid) continue;
 		if (isStale(file, owner)) {
 			try {
@@ -367,10 +389,10 @@ export function leasedByOthers(
  */
 export function leaseOwner(
 	providerId: string,
-	index: number,
+	entryName: string,
 	configFile?: string,
 ): number | undefined {
-	const file = leaseFile(providerId, index, configFile);
+	const file = leaseFile(providerId, entryName, configFile);
 	const owner = readOwner(file);
 	if (owner === undefined) return undefined;
 	if (isStale(file, owner)) return undefined;

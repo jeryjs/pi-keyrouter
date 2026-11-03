@@ -222,6 +222,13 @@ interface ProviderRuntime {
 	 */
 	rotateOnQuota: boolean;
 	/** How the next entry is picked at each turn boundary (per-pool setting). */
+	/**
+	 * Whether this pool's idle accounts may be refreshed at session start.
+	 * Off unless the config opts in with `sweepRefresh: true` — the sweep
+	 * exchanges a refresh token per idle account, and that is not race-free yet
+	 * (see TODO.md). Only OAuth pools can have it.
+	 */
+	sweepRefresh: boolean;
 	strategy: RotationStrategy;
 	/** Entries for both kinds: the shared rotation machinery operates on these. */
 	keys: KeyState[];
@@ -267,7 +274,7 @@ interface ProviderRuntime {
 	 * holds ONE credential per provider id, shared by every process, so there
 	 * is no slot to lease there.
 	 */
-	claimed: number;
+	claimedName: string | undefined;
 	/**
 	 * Pool entries serving an in-flight provider request in THIS process,
 	 * oldest first.
@@ -365,7 +372,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			injecting: false,
 			pendingContinue: false,
 			continuations: 0,
-			claimed: -1,
+			claimedName: undefined,
 			busy: [],
 		};
 		runtimes.set(providerId, rt);
@@ -540,7 +547,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	function leasedIndices(rt: ProviderRuntime): ReadonlySet<number> {
 		const leased = new Set<number>(rt.busy);
 		if (rt.kind === "keys") {
-			for (const index of leasedByOthers(rt.providerId, rt.keys.length)) leased.add(index);
+			for (const index of leasedByOthers(rt.providerId, rt.keys.map((key) => key.name))) {
+				leased.add(index);
+			}
 		}
 		return leased;
 	}
@@ -555,9 +564,36 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 */
 	function takeLease(rt: ProviderRuntime, index: number): void {
 		if (rt.kind !== "keys" || index < 0) return;
-		if (rt.claimed >= 0 && rt.claimed !== index) releaseLease(rt.providerId, rt.claimed);
-		rt.claimed = claimLease(rt.providerId, index) ? index : -1;
-		if (rt.claimed < 0) trace(`lease ${rt.providerId} entry ${index} (held by another process)`);
+		const name = rt.keys[index]?.name;
+		if (!name) return;
+		if (rt.claimedName !== undefined && rt.claimedName !== name) {
+			releaseLease(rt.providerId, rt.claimedName);
+		}
+		rt.claimedName = claimLease(rt.providerId, name) ? name : undefined;
+		if (rt.claimedName === undefined) {
+			trace(`lease ${rt.providerId} entry ${name} (held by another process)`);
+		}
+	}
+
+	/** Drop this process's claim on the entry it is using. */
+	function releaseCurrentLease(rt: ProviderRuntime): void {
+		if (rt.claimedName === undefined) return;
+		releaseLease(rt.providerId, rt.claimedName);
+		rt.claimedName = undefined;
+	}
+
+	/**
+	 * Put the claim back on an entry after a failed install.
+	 *
+	 * A failed install means this process never moved off the entry it had, so
+	 * its claim must not stay on the entry it failed to install.
+	 */
+	function restoreLease(rt: ProviderRuntime, entryName: string | undefined): void {
+		if (rt.kind !== "keys") return;
+		releaseCurrentLease(rt);
+		if (entryName !== undefined && claimLease(rt.providerId, entryName)) {
+			rt.claimedName = entryName;
+		}
 	}
 
 	/**
@@ -1796,7 +1832,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						// claim: "this-session" is this process, a pid is another pi
 						// process, "in-flight" is one of our requests still running.
 						const inFlight = rt.busy.filter((index) => index === ki).length;
-						const owner = rt.kind === "keys" ? leaseOwner(rt.providerId, ki) : undefined;
+						const owner = rt.kind === "keys" ? leaseOwner(rt.providerId, k.name) : undefined;
 						const lease =
 							inFlight > 0
 								? ` lease=in-flight(${inFlight})`

@@ -556,7 +556,7 @@ const cases = [
 		before: () => {
 			const leaseDir = join(PI_HOME, "keyrouter-leases");
 			mkdirSync(leaseDir, { recursive: true });
-			writeFileSync(join(leaseDir, "krtest.0.lease"), `${process.ppid}\n`, "utf8");
+			writeFileSync(join(leaseDir, "krtest.A.lease"), `${process.ppid}\n`, "utf8");
 		},
 		plan: { default: "ok", text: "PONG" },
 		expect: ({ keys, trace, pi }) => [
