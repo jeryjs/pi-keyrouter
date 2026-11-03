@@ -2426,12 +2426,15 @@ function findPool(
  * Match a pool entry by exact name, then case-insensitively, then by its
  * 1-based position in the pool.
  */
-function matchEntry<T extends { name: string }>(entries: readonly T[], label: string): T | undefined {
+export function matchEntry<T extends { name: string }>(entries: readonly T[], label: string): T | undefined {
 	const exact = entries.find((entry) => entry.name === label);
 	if (exact) return exact;
 	const lower = label.toLowerCase();
-	const insensitive = entries.find((entry) => entry.name.toLowerCase() === lower);
-	if (insensitive) return insensitive;
+	const insensitive = entries.filter((entry) => entry.name.toLowerCase() === lower);
+	if (insensitive.length === 1) return insensitive[0];
+	// More than one case-insensitive match is ambiguous. Picking the first would
+	// delete a credential the user did not name, so the command refuses instead.
+	if (insensitive.length > 1) return undefined;
 	if (/^\d+$/.test(label)) {
 		const ordinal = Number(label) - 1;
 		return ordinal >= 0 && ordinal < entries.length ? entries[ordinal] : undefined;

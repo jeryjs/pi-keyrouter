@@ -49,6 +49,8 @@ const {
 	SUBCOMMANDS,
 	alreadyUsingMessage,
 	planOAuthAddition,
+	matchEntry,
+	planKeyAddition,
 	startupSweepEnabled,
 } = await import("../index.ts");
 
@@ -567,6 +569,83 @@ check(
 		requestedName: "custom-new-name",
 		identityPath: "accountId",
 	}).kind === "duplicate",
+);
+
+// Names are matched case-insensitively as well: two entries whose names differ
+// only in case are indistinguishable to the user, and a command that picks one
+// of them by accident edits or deletes a credential they did not name.
+check(
+	"a generated name never collides case-insensitively",
+	uniquePoolEntryName("Work", ["work"]).name === "Work-2" &&
+		uniquePoolEntryName("Work", ["work"]).adjusted === true,
+);
+check(
+	"a name that differs only in case updates the existing entry",
+	planOAuthAddition({
+		credential: liveSameIdentity,
+		accounts: identityPool,
+		requestedName: "JSJERY123",
+		identityPath: "accountId",
+	}).kind === "update",
+);
+check(
+	"a case-insensitive name that matches twice is ambiguous",
+	planOAuthAddition({
+		credential: liveSameIdentity,
+		accounts: [
+			{ name: "Work", credential: identityPool[0].credential },
+			{ name: "work", credential: identityPool[0].credential },
+		],
+		requestedName: "WORK",
+		identityPath: "accountId",
+	}).kind === "ambiguous",
+);
+const matchNames = [{ name: "Key-1" }, { name: "key-1" }, { name: "other" }];
+check("an exact name wins", matchEntry(matchNames, "other")?.name === "other");
+check(
+	"a case-insensitive match that is not unique is refused",
+	matchEntry(matchNames, "KEY-1") === undefined,
+);
+check(
+	"a unique case-insensitive match resolves",
+	matchEntry([{ name: "Key-1" }, { name: "other" }], "key-1")?.name === "Key-1",
+);
+check("a 1-based ordinal still resolves", matchEntry(matchNames, "3")?.name === "other");
+
+// The keys-pool half of the same rules:
+const keyEntries = [
+	{ name: "primary", value: "sk-1" },
+	{ name: "backup", value: "sk-2" },
+];
+check(
+	"a named existing key is updated in place",
+	planKeyAddition({ value: "sk-3", requestedName: "backup", entries: keyEntries }).kind === "update" &&
+		planKeyAddition({ value: "sk-3", requestedName: "backup", entries: keyEntries }).name === "backup",
+);
+check(
+	"a key name that differs only in case is updated in place",
+	planKeyAddition({ value: "sk-3", requestedName: "BACKUP", entries: keyEntries }).kind === "update",
+);
+check(
+	"a key name that matches twice is ambiguous",
+	planKeyAddition({ value: "sk-3", requestedName: "BACKUP", entries: [
+		{ name: "Backup", value: "sk-1" },
+		{ name: "backup", value: "sk-2" },
+	] }).kind === "ambiguous",
+);
+check(
+	"a key the pool already holds is refused, not added twice",
+	planKeyAddition({ value: "sk-1", requestedName: "third", entries: keyEntries }).kind === "duplicate" &&
+		planKeyAddition({ value: "sk-1", requestedName: "third", entries: keyEntries }).name === "primary",
+);
+check(
+	"a new key gets the next numbered name",
+	planKeyAddition({ value: "sk-3", entries: keyEntries }).kind === "add" &&
+		planKeyAddition({ value: "sk-3", entries: keyEntries }).name === "key-3",
+);
+check(
+	"a new key keeps a name the user typed",
+	planKeyAddition({ value: "sk-3", requestedName: "spare", entries: keyEntries }).name === "spare",
 );
 
 // ---------------------------------------------------------------------------

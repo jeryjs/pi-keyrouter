@@ -530,10 +530,14 @@ export function uniquePoolEntryName(
 	existingNames: readonly string[],
 ): { name: string; adjusted: boolean } {
 	const wanted = base.trim() || "entry";
-	const taken = new Set(existingNames);
-	if (!taken.has(wanted)) return { name: wanted, adjusted: false };
+	// Names that differ only in case are the same name to the user, so they
+	// collide: adding "Work" next to "work" would make every later lookup
+	// ambiguous.
+	const taken = new Set(existingNames.map((name) => name.toLowerCase()));
+	const wantedKey = wanted.toLowerCase();
+	if (!taken.has(wantedKey)) return { name: wanted, adjusted: false };
 	let suffix = 2;
-	while (taken.has(`${wanted}-${suffix}`)) suffix += 1;
+	while (taken.has(`${wantedKey}-${suffix}`)) suffix += 1;
 	return { name: `${wanted}-${suffix}`, adjusted: true };
 }
 
