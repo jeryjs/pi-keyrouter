@@ -13,7 +13,7 @@
 // TypeScript sources are loaded through Node's type-stripping, so no build step
 // is involved — same as pi's own jiti loading of the extension.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1023,6 +1023,31 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	);
 	rmSync(failedTemp, { recursive: true, force: true });
 	process.env.PI_KEYROUTER_CONFIG = persistFile;
+
+	// --- the cross-process write lock -------------------------------------
+	// A write-back is a read-modify-write of the user's config, so two pi
+	// processes rotating at the same time could each read the same bytes and
+	// one would overwrite the other's change. The lock closes that window, and
+	// the properties below are the whole contract: it is released, a dead
+	// writer's lock is reclaimed, and a live one is waited out rather than
+	// allowed to block the session.
+	const lockDir = join(persistDir, "keyrouter-leases");
+	const lockFile = join(lockDir, "config.lock");
+
+	check("a successful write leaves no lock behind", writeBackActive("cline", "a3").updated === 1);
+	check("the lock file is gone afterwards", !existsSync(lockFile));
+
+	mkdirSync(lockDir, { recursive: true });
+	writeFileSync(lockFile, "999999999\n", "utf8");
+	const longAgo = new Date(Date.now() - 60_000);
+	utimesSync(lockFile, longAgo, longAgo);
+	check("a stale lock does not stop the write", writeBackActive("cline", "a4").updated === 1);
+	check("a stale lock is cleared", !existsSync(lockFile));
+
+	writeFileSync(lockFile, `${process.pid}\n`, "utf8");
+	check("a lock that cannot be taken is not waited on forever", writeBackActive("cline", "a5").updated === 1);
+	check("another process's lock is left alone", existsSync(lockFile));
+	rmSync(lockFile, { force: true });
 
 	// --- pool entries: what the guided add/remove commands write ---------
 	const addedKey = writeBackPoolEntry("google", "add", { name: "k2", value: "sk-2" });

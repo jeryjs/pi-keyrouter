@@ -48,18 +48,6 @@ Open items:
 When these are fixed, the per-pool opt-in can become the recommended setting and the
 `PI_KEYROUTER_SWEEP` override can go.
 
-## Cross-process config write lock
-
-Every writer in `config.ts` does a read-modify-write of `~/.pi/keyrouter.json`. The
-read and the rename are microseconds apart, so two pi processes can lose one update
-(last writer wins) — the file stays valid, but one process's change is gone. The temp
-file already carries the process id, so the writes cannot corrupt each other; only
-the lost update remains.
-
-*Done when* the read-modify-write runs under a cross-process lock that lives in the
-existing `~/.pi/keyrouter-leases/` directory, and a lock that cannot be taken (a
-crashed owner) falls back to writing anyway rather than blocking the config.
-
 ## Lease takeover: stale claims and pid reuse
 
 A claim is stale when its owner process is gone, or when the file is older than the

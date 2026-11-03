@@ -214,6 +214,132 @@ export function parseAccountCredential(
 	return validateCredential(parsed);
 }
 
+// =============================================================================
+// One writer at a time, across processes
+// =============================================================================
+//
+// Every write-back below is a read-modify-write of the same file: read
+// `keyrouter.json`, change ONE field, rename a temp file over it. Two pi
+// processes doing that at once both read the same bytes, and the second rename
+// throws the first process's change away. The file stays valid — the temp name
+// carries the pid, so the bytes cannot interleave — but one update is lost.
+//
+// The lock closes that window: for every other process, the read and the rename
+// become one step. It is a file because it has to be visible to other processes,
+// and it lives in the lease directory rather than beside the config so that
+// nothing a lock does can touch the file the user hand-edits. The create uses
+// `wx`, which the filesystem makes atomic: two processes cannot both create it,
+// so no further protocol is needed to pick a winner.
+//
+// The lock is held for microseconds, so one older than CONFIG_LOCK_TTL_MS was
+// left by a writer that died. If it still cannot be taken after a short wait the
+// writer goes ahead without it: a config write must never block a session, and
+// an unlocked write is still atomic.
+
+/** How long the write lock may exist before it is treated as abandoned. */
+const CONFIG_LOCK_TTL_MS = 5_000;
+
+/** How long a writer waits for the lock before writing without it. */
+const CONFIG_LOCK_WAIT_MS = 10;
+
+/** Re-entrancy depth per lock file, so a writer may call another writer. */
+const writeLockDepth = new Map<string, number>();
+
+/** Block this thread briefly, without a timer and without spinning. */
+function sleepSync(ms: number): void {
+	try {
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+	} catch {
+		// No shared memory available: skip the wait. The caller's deadline still
+		// bounds how long it tries.
+	}
+}
+
+/** The lock file that guards writes to the config at `file`. */
+function writeLockFile(file: string): string {
+	return path.join(path.dirname(path.resolve(file)), "keyrouter-leases", "config.lock");
+}
+
+/**
+ * Take the write lock.
+ *
+ * False means "go on without it": the caller still writes atomically, it just
+ * cannot promise that no concurrent update was lost.
+ */
+function acquireWriteLock(lock: string): boolean {
+	try {
+		fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+	} catch {
+		return false; // no lease directory: the writers stay atomic but unlocked
+	}
+	const deadline = Date.now() + CONFIG_LOCK_WAIT_MS;
+	for (;;) {
+		try {
+			fs.writeFileSync(lock, `${process.pid}\n`, { encoding: "utf-8", flag: "wx", mode: 0o600 });
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+		}
+		let age: number;
+		try {
+			age = Date.now() - fs.statSync(lock).mtimeMs;
+		} catch {
+			continue; // released between the create and the stat: try again
+		}
+		if (age > CONFIG_LOCK_TTL_MS) {
+			// Its writer is gone. Removing is best effort; if it fails the next
+			// attempt simply sees EEXIST again.
+			try {
+				fs.rmSync(lock, { force: true });
+			} catch {
+				return false;
+			}
+			continue;
+		}
+		if (Date.now() >= deadline) return false; // busy: write without it
+		sleepSync(1);
+	}
+}
+
+/** Release the lock, but never somebody else's. */
+function releaseWriteLock(lock: string): void {
+	try {
+		if (fs.readFileSync(lock, "utf-8").trim() !== String(process.pid)) return;
+	} catch {
+		return; // already gone
+	}
+	try {
+		fs.rmSync(lock, { force: true });
+	} catch {
+		// Best effort: a leftover lock is reclaimed once it ages past the TTL.
+	}
+}
+
+/**
+ * Run `fn` while holding the cross-process write lock for the config at `file`.
+ *
+ * Re-entrant within this process, so a write-back may call another write-back
+ * without deadlocking on its own lock file.
+ */
+function withConfigWriteLock<T>(file: string, fn: () => T): T {
+	const lock = writeLockFile(file);
+	const depth = writeLockDepth.get(lock) ?? 0;
+	if (depth === 0 && !acquireWriteLock(lock)) return fn();
+	writeLockDepth.set(lock, depth + 1);
+	try {
+		return fn();
+	} finally {
+		const left = (writeLockDepth.get(lock) ?? 1) - 1;
+		if (left > 0) {
+			writeLockDepth.set(lock, left);
+		} else {
+			writeLockDepth.delete(lock);
+			releaseWriteLock(lock);
+		}
+	}
+}
+
+
 /**
  * Write a refreshed OAuth credential back into `keyrouter.json`, in place.
  *
@@ -245,6 +371,15 @@ export function parseAccountCredential(
  * @returns the number of accounts updated (0 when there was nothing to do)
  */
 export function writeBackCredentials(
+	updates: ReadonlyMap<string, OAuthCredential>,
+	home?: string,
+): { updated: number } | { error: string } {
+	return withConfigWriteLock(configPath(undefined, home), () =>
+		writeBackCredentialsNow(updates, home),
+	);
+}
+
+function writeBackCredentialsNow(
 	updates: ReadonlyMap<string, OAuthCredential>,
 	home?: string,
 ): { updated: number } | { error: string } {
@@ -329,6 +464,16 @@ export function writeBackActive(
 	entryName: string | undefined,
 	home?: string,
 ): { updated: number } | { error: string } {
+	return withConfigWriteLock(configPath(undefined, home), () =>
+		writeBackActiveNow(providerName, entryName, home),
+	);
+}
+
+function writeBackActiveNow(
+	providerName: string,
+	entryName: string | undefined,
+	home?: string,
+): { updated: number } | { error: string } {
 	const file = configPath(undefined, home);
 	let rawText: string;
 	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
@@ -392,6 +537,16 @@ export function writeBackStrategy(
 	strategy: RotationStrategy,
 	home?: string,
 ): { updated: number } | { error: string } {
+	return withConfigWriteLock(configPath(undefined, home), () =>
+		writeBackStrategyNow(providerName, strategy, home),
+	);
+}
+
+function writeBackStrategyNow(
+	providerName: string,
+	strategy: RotationStrategy,
+	home?: string,
+): { updated: number } | { error: string } {
 	const file = configPath(undefined, home);
 	let rawText: string;
 	let parsed: { providers?: Array<Record<string, unknown>> } & Record<string, unknown>;
@@ -446,6 +601,15 @@ export function writeBackStrategy(
  * @returns 1 when the level changed, 0 when it was already current
  */
 export function writeBackNotifications(
+	level: NotificationLevel,
+	home?: string,
+): { updated: number } | { error: string } {
+	return withConfigWriteLock(configPath(undefined, home), () =>
+		writeBackNotificationsNow(level, home),
+	);
+}
+
+function writeBackNotificationsNow(
 	level: NotificationLevel,
 	home?: string,
 ): { updated: number } | { error: string } {
@@ -571,6 +735,17 @@ export function uniquePoolEntryName(
  * @returns the number of pools updated (0 when there was nothing to do)
  */
 export function writeBackPoolEntry(
+	providerName: string,
+	action: "add" | "update" | "remove",
+	entry: { name: string; value?: string; credential?: OAuthCredential },
+	home?: string,
+): { updated: number } | { error: string } {
+	return withConfigWriteLock(configPath(undefined, home), () =>
+		writeBackPoolEntryNow(providerName, action, entry, home),
+	);
+}
+
+function writeBackPoolEntryNow(
 	providerName: string,
 	action: "add" | "update" | "remove",
 	entry: { name: string; value?: string; credential?: OAuthCredential },

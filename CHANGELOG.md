@@ -63,6 +63,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Config writers no longer share one temp file.** The temp file carries the process id, so two pi
   processes writing the same config cannot rename each other's bytes over the real file.
 
+- **Config writes are serialised across processes.** Every write-back now takes a short-lived lock in the
+  lease directory, so two pi processes rotating at the same time cannot lose each other's update. A lock
+  left behind by a writer that died is reclaimed; if one still cannot be taken the write goes ahead
+  anyway — a config write must never block a session.
+
 ## [1.7.0] — 2026-10-31
 
 ### Added
