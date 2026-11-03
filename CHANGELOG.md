@@ -20,6 +20,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-11-03
+
 ### Added
 
 - **`sweepRefresh` — a per-pool opt-in for the idle-account sweep.** The session-start sweep refreshes
@@ -619,7 +621,8 @@ The last release of the original line, and the version this fork started from.
   `rate-limited` or `unauthorized` with a cooldown, plus clearing the override
   and surfacing the real error once all keys are exhausted.
 
-[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/jeryjs/pi-keyrouter/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/jeryjs/pi-keyrouter/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/jeryjs/pi-keyrouter/compare/v1.5.0...v1.6.0
