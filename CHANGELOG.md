@@ -20,6 +20,49 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`sweepRefresh` — a per-pool opt-in for the idle-account sweep.** The session-start sweep refreshes
+  the accounts of a pool that no request has touched for a while, so their tokens do not sit expired
+  until the day one is needed. It is now enabled per pool with `"sweepRefresh": true` in that
+  provider's config, and it is **off everywhere else**: the exchange is not race-free yet (the open
+  races are written up in `TODO.md`), so it must not run unless a pool asks for it. `keys` pools never
+  sweep — they have no tokens — and say so when the option is set on one.
+
+### Fixed
+
+- **`/keyrouter add` and `/keyrouter remove` no longer pick the wrong entry.** Entry names are now
+  matched case-insensitively — `Backup` and `backup` are the same name to you — and a name that
+  matches two entries is **refused** instead of silently taking the first one. A keys pool also
+  refuses a key the pool already holds under another name, so the pool cannot rotate onto one
+  credential twice.
+
+- **A captured OAuth account stays active.** The account `/keyrouter add` captures from pi's own
+  store becomes the pool's active account, so the reload that follows does not switch pi back to the
+  account it had before. `add` and `remove` no longer activate the pools before they capture, which
+  used to overwrite the login the user had just made.
+
+- **An empty pool is kept instead of being dropped.** A pool whose entries all fail to expand (a
+  missing `$ENV`, for example) is still listed, so `/keyrouter add` can put the first entry into it.
+  Two pools that share a name are a config mistake: the first one is used, the second is reported, and
+  a write touches only the first.
+
+- **A lease belongs to its entry, not to its position.** The claim file under
+  `~/.pi/keyrouter-leases/` is now named after the entry, so removing or reordering entries in a pool no
+  longer leaves a claim protecting a different credential (or none at all).
+
+- **A lease is claimed before the credential is installed**, not after, so another process cannot pick
+  the same entry in between. A failed install puts the claim back on the entry that is still in use.
+  A manual `/keyrouter account` pin now takes the claim, and a pool that runs out of usable keys
+  releases it instead of leaving the entry blocked for every other process.
+
+- **Reloading the pools no longer forgets what the session learned.** Cooldowns, failure counts,
+  usage counts and the last status of an unchanged entry survive `/keyrouter add`, `/keyrouter remove`
+  and every other reload.
+
+- **Config writers no longer share one temp file.** The temp file carries the process id, so two pi
+  processes writing the same config cannot rename each other's bytes over the real file.
+
 ## [1.7.0] — 2026-10-31
 
 ### Added

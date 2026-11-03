@@ -196,10 +196,12 @@ another directory. Left alone they all install the same first entry and then hit
 the same time. A **lease** is the coordination: an exclusive claim on one entry of a pool.
 
 The claim is a file under `~/.pi/keyrouter-leases/`, created with an exclusive create, so the
-filesystem — not a lock protocol — decides the winner. The first process to install an entry holds
-the claim; another process sees it and picks a different entry. The claim is released when the
-entry is replaced, when the pools are handed back (`reset`, `reload`), and at shutdown. A claim
-whose owner process is gone is stale and is taken over.
+filesystem — not a lock protocol — decides the winner. The claim is taken on the **entry**, not on
+its position in the pool, so removing or reordering entries cannot detach it from the credential it
+was taken for. The first process to install an entry holds the claim; another process sees it and
+picks a different entry. The claim is released when the entry is replaced, when the pools are handed
+back (`reset`, `reload`), and at shutdown. A claim whose owner process is gone is stale and is taken
+over.
 
 Within one process, a request holds its entry for the duration of that request, so a rotation never
 walks onto a credential that is already serving one. A lease is a **preference, never a lock**: when
@@ -297,6 +299,11 @@ holds them and swaps them in.
   [Rotation rules](#rotation-rules).
 - `identityPath` (optional) says where this provider's account identity lives inside a credential.
   See [Attributing a refreshed credential](#attributing-a-refreshed-credential).
+- `sweepRefresh` (default `false`) lets this pool refresh its **idle** accounts at session start — the
+  accounts no request has touched for a while, whose tokens would otherwise sit expired until the day
+  one of them is needed. It is **opt-in per pool**: one provider that needs it says so, and every other
+  pool keeps its tokens untouched. The exchange is not race-free yet (see `TODO.md`), so it is off by
+  default; enable it only for a pool that has actually gone stale.
 
 **How it works.** keyrouter installs an account with pi's own credential store
 (`runtime.credentials.modify`), so pi's file lock, cache and revision counter all stay coherent.
@@ -488,12 +495,14 @@ other than `failover` also shows up in `/keyrouter status` next to the pool's `s
 `add` and `remove` manage a pool's entries without hand-editing the file:
 
 ```
+```
 /keyrouter add tokenharbor backup      → prompts for the key, then:
                                          added backup to tokenharbor. It joins the pool on the next turn.
 /keyrouter add tokenharbor              → the name defaults to key-3
 /keyrouter add tokenharbor old         → "old" is already in the pool: prompts for the key, then:
                                          updated old in tokenharbor.
 /keyrouter add cline                   → captures the account pi is holding (run /login first)
+                                         added home to cline. It is now the active account.
 /keyrouter remove tokenharbor backup    → confirms, then:
                                          removed backup from tokenharbor.
 ```
@@ -503,7 +512,9 @@ runs a login of its own. (pi's prompt is a plain text field, not a masked one, s
 visible while you type it.) For an `accounts` pool it captures the credential **pi** is holding right
 now, so the flow stays pi's own: `/login` first, then `/keyrouter add <provider>`. If pi is already
 holding one of the pool's accounts, the command says so — and tells you to `/login` another account
-first — rather than adding the same credential twice.
+first — rather than adding the same credential twice. On an `accounts` pool the account that was just
+captured becomes the pool's **active** account: you signed into it on purpose, so the reload that
+follows leaves pi on that account instead of switching back to the previous one.
 
 **Adding knows who you are.** For an `accounts` pool the match is made on the account's *identity*
 — the provider's `identityPath`, or the identity claims a token carries (see
@@ -523,8 +534,15 @@ confirmation before replacing it. An entry whose value comes from an external so
 or the file instead, because that value is yours to maintain. A generated name that is already taken
 gets a numbered suffix (`key-2`, `key-3`, …) and a note; a name you typed yourself is kept as typed.
 
+**Names are matched case-insensitively**, because `Backup` and `backup` are the same name to you:
+an update or a removal that names one of them finds the other too. If two entries in the pool
+differ only in case, the command **refuses** instead of guessing which one you meant. On a `keys`
+pool, a key the pool already holds is refused as well — adding it under a second name would make
+the pool rotate onto one credential twice.
+
 `remove` deletes the entry from the file after a confirmation, and forgets the pool's `active`
-position when that was the entry removed. pi's own login is never touched.
+position when that was the entry removed. The pool itself keeps managing the provider, so pi keeps
+using the pool's credential for it — only the removed entry is gone.
 
 `status` prints, per provider: the pool kind, the active entry, whether keyrouter has installed
 anything, pi's own `source` for the provider, and each entry's `uses`, `fails`, last status and
