@@ -1326,6 +1326,25 @@ try {
 		shifted.has(0) && !shifted.has(1),
 	);
 
+	// A claim whose entry is no longer in the pool can never be released by its
+	// owner once that process is gone. The index-keyed claim files left by older
+	// versions name entries that are not in the pool at all, so this is also what
+	// clears them: the next look at the pool removes a stale one and leaves a
+	// live one alone — the owner may be part-way through adding that entry.
+	const orphanFile = join(leaseDir, "p.k9.lease");
+	writeFileSync(orphanFile, "999999999\n", "utf8");
+	check(
+		"a claim for an entry that is gone is not counted as leased",
+		!leasedByOthers("p", ["k1", "k2"], leaseConfig).has(9),
+	);
+	check("a stale claim for a removed entry is cleaned up", !existsSync(orphanFile));
+
+	const liveOrphan = join(leaseDir, "p.k8.lease");
+	writeFileSync(liveOrphan, `${process.ppid}\n`, "utf8");
+	leasedByOthers("p", ["k1", "k2"], leaseConfig);
+	check("a live claim for a removed entry is left alone", existsSync(liveOrphan));
+	rmSync(liveOrphan, { force: true });
+
 	// The selection half: a leased entry is skipped, but a lease never
 	// deadlocks the picker.
 	const leasedStates = initKeyStates([
