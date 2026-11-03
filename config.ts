@@ -598,6 +598,10 @@ export function writeBackPoolEntry(
 			} else {
 				if (!entry.credential) continue;
 				list.push({ name: entry.name, credential: entry.credential });
+				// An account captured from pi's own store becomes the pool's active
+				// account: the user signed into it on purpose, and the reload that
+				// follows must not switch pi back to the account it had before.
+				provider.active = entry.name;
 			}
 		} else if (action === "update") {
 			const item = list.find((candidate) => candidate?.name === entry.name);
@@ -624,6 +628,9 @@ export function writeBackPoolEntry(
 				}
 				if (JSON.stringify(item.credential) === JSON.stringify(entry.credential)) continue;
 				item.credential = entry.credential;
+				// Same for an account whose credential was just refreshed: pi is
+				// logged into it right now, so it stays the active one.
+				provider.active = entry.name;
 			}
 		} else {
 			const index = list.findIndex((item) => item?.name === entry.name);

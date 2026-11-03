@@ -1027,6 +1027,10 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 		"the account entry keeps its credential",
 		pool.providers[0].accounts[2].name === "a3" && pool.providers[0].accounts[2].credential.access === "new-access",
 	);
+	check(
+		"a captured account becomes the pool's active account",
+		pool.providers[0].active === "a3",
+	);
 
 	// `update` changes only the named entry's credential. Its position, sibling
 	// entries, provider fields, and unknown top-level fields all stay put.
@@ -1059,6 +1063,10 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 			pool.providers[0].accounts[2].name === "a3" &&
 			pool.providers[0]._customProviderField === "must-survive" &&
 			pool._customTopLevelField === "must-survive",
+	);
+	check(
+		"an account whose credential was refreshed becomes the active one",
+		JSON.parse(readFileSync(persistFile, "utf8")).providers[0].active === "a1",
 	);
 	const beforeNoopUpdate = readFileSync(persistFile, "utf8");
 	const noopAccountUpdate = writeBackPoolEntry("cline", "update", {
