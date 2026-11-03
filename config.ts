@@ -350,6 +350,8 @@ export function writeBackActive(
 			provider.active = entryName;
 		}
 		updated += 1;
+		// Only the FIRST pool with this name is edited — see writeBackPoolEntry.
+		break;
 	}
 	if (updated === 0) return { updated: 0 };
 
@@ -407,6 +409,8 @@ export function writeBackStrategy(
 			provider.strategy = strategy;
 		}
 		updated += 1;
+		// Only the FIRST pool with this name is edited — see writeBackPoolEntry.
+		break;
 	}
 	if (updated === 0) return { updated: 0 };
 
@@ -630,6 +634,10 @@ export function writeBackPoolEntry(
 			if (provider.active === entry.name) delete provider.active;
 		}
 		updated += 1;
+		// Only the FIRST pool with this name is edited. Two pools sharing a name
+		// are a config mistake, and touching both would change a pool the user
+		// did not name.
+		break;
 	}
 	if (updated === 0) return { updated: 0 };
 
@@ -733,9 +741,21 @@ export function normalizeStrategy(
 function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 	const warnings: string[] = [];
 	const providers: ProviderPool[] = [];
+	// Pool names are provider ids, and provider ids are matched case-
+	// insensitively, so two pools whose names differ only in case are the same
+	// pool. The first one wins; the rest are reported and ignored.
+	const seenNames = new Set<string>();
 
 	for (const raw of input.providers ?? []) {
 		if (typeof raw?.name !== "string" || !raw.name) continue;
+		const nameKey = raw.name.toLowerCase();
+		if (seenNames.has(nameKey)) {
+			warnings.push(
+				`"${raw.name}": duplicate pool name — only the first pool with this name is used.`,
+			);
+			continue;
+		}
+		seenNames.add(nameKey);
 		const hasKeys = Array.isArray(raw.keys);
 		const hasAccounts = Array.isArray(raw.accounts);
 

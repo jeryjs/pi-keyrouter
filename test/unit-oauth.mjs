@@ -1135,6 +1135,34 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 		writeBackPoolEntry("google", "remove", { name: "nope" }).updated === 0,
 	);
 
+	// Two pools that share a name are a config mistake. The writer touches the
+	// FIRST one only: changing both would alter a pool the user did not name.
+	const duplicatePoolFile = join(persistDir, "duplicate-pool.json");
+	writeFileSync(
+		duplicatePoolFile,
+		JSON.stringify(
+			{
+				providers: [
+					{ name: "dup", keys: [{ name: "a", value: "sk-1" }] },
+					{ name: "dup", keys: [{ name: "b", value: "sk-2" }] },
+				],
+			},
+			null,
+			2,
+		) + "\n",
+		"utf8",
+	);
+	process.env.PI_KEYROUTER_CONFIG = duplicatePoolFile;
+	check(
+		"a write to a duplicated pool name succeeds once",
+		writeBackPoolEntry("dup", "add", { name: "c", value: "sk-3" }).updated === 1,
+	);
+	const duplicatePools = JSON.parse(readFileSync(duplicatePoolFile, "utf8")).providers;
+	check(
+		"only the first pool with that name is edited",
+		duplicatePools[0].keys.length === 2 && duplicatePools[1].keys.length === 1,
+	);
+
 	delete process.env.PI_KEYROUTER_CONFIG;
 	} finally {
 		rmSync(persistDir, { recursive: true, force: true });
