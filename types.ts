@@ -105,6 +105,15 @@ export interface ProviderConfig {
 	 *   "accountId"          compare the credential's own `accountId`
 	 */
 	identityPath?: string;
+	/**
+	 * Refresh this pool's IDLE accounts at session start. Off by default: the
+	 * sweep exchanges a refresh token for every idle account, and that exchange is
+	 * not free of races yet (see TODO.md). Opt in per pool, not globally: one
+	 * provider that needs its idle accounts kept alive says so, and every other
+	 * pool keeps its tokens untouched. Ignored for `keys` pools, which have no
+	 * tokens to refresh.
+	 */
+	sweepRefresh?: boolean;
 }
 
 /**

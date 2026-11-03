@@ -808,13 +808,19 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				// silently accepting a setting that changes nothing.
 				warnings.push(`"${raw.name}": "identityPath" applies only to "accounts" pools — ignored.`);
 			}
+			if (raw.sweepRefresh !== undefined) {
+				// The idle-account sweep exchanges OAuth refresh tokens. An api-key
+				// pool has no tokens, so the option cannot mean anything here.
+				warnings.push(`"${raw.name}": "sweepRefresh" applies only to "accounts" pools — ignored.`);
+			}
 			providers.push({
 				name: raw.name,
 				match: Array.isArray(raw.match) ? raw.match : [],
 				keys,
 				kind: "keys" satisfies PoolKind,
-			takeoverOAuth: raw.takeoverOAuth === true,
-			strategy: normalizeStrategy(raw.strategy, "keys" satisfies PoolKind, raw.name, warnings),
+				takeoverOAuth: raw.takeoverOAuth === true,
+				strategy: normalizeStrategy(raw.strategy, "keys" satisfies PoolKind, raw.name, warnings),
+				sweepRefresh: false,
 				active: typeof raw.active === "string" ? raw.active : undefined,
 			});
 			continue;
@@ -861,9 +867,13 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				// limit is exactly when the next account is wanted. Default true.
 			rotateOnQuota: raw.rotateOnQuota !== false,
 			strategy: normalizeStrategy(raw.strategy, "oauth" satisfies PoolKind, raw.name, warnings),
-				identityPath: identityPath.ok ? identityPath.path : undefined,
-				active: typeof raw.active === "string" ? raw.active : undefined,
-			});
+			// The idle-account sweep is opt-in per pool. Off unless the config
+			// says so: see TODO.md for what still has to be fixed before it can be
+			// recommended.
+			sweepRefresh: raw.sweepRefresh === true,
+			identityPath: identityPath.ok ? identityPath.path : undefined,
+			active: typeof raw.active === "string" ? raw.active : undefined,
+		});
 			continue;
 		}
 

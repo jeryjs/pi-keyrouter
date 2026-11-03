@@ -301,7 +301,35 @@ try {
 	);
 	check("rotateOnQuota: false is honoured", loadConfig().providers[0]?.rotateOnQuota === false);
 
-	// An OAuth pool with no usable accounts is dropped entirely.
+	// sweepRefresh: the idle-account sweep is opt-in per pool, and off by
+	// default.
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({
+			providers: [
+				{ name: "swept", accounts: [{ name: "a", credential: VALID }], sweepRefresh: true },
+				{ name: "quiet", accounts: [{ name: "a", credential: VALID }] },
+			],
+		}),
+		"utf8",
+	);
+	const sweepCfg = loadConfig();
+	check("sweepRefresh: true opts a pool in", sweepCfg.providers[0]?.sweepRefresh === true);
+	check("the sweep is off for a pool that did not ask for it", sweepCfg.providers[1]?.sweepRefresh === false);
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({ providers: [{ name: "tokenharbor", keys: [{ name: "a", value: "sk-1" }], sweepRefresh: true }] }),
+		"utf8",
+	);
+	const keysSweepCfg = loadConfig();
+	check("a keys pool never sweeps", keysSweepCfg.providers[0]?.sweepRefresh === false);
+	check(
+		"a keys pool says that sweepRefresh does not apply to it",
+		(keysSweepCfg.warnings ?? []).some((w) => /"sweepRefresh" applies only to "accounts" pools/.test(w)),
+	);
+
+	// An OAuth pool with no usable accounts is KEPT, so `/keyrouter add` can
+	// put the first account into it. It installs nothing until it has one.
 	writeFileSync(cfgFile, JSON.stringify({ providers: [{ name: "cline", accounts: [] }] }), "utf8");
 	const emptyPool = loadConfig();
 	check("an OAuth pool with no accounts is kept", emptyPool.providers.length === 1);
@@ -1315,8 +1343,11 @@ try {
 
 	// Sweep claims must not leak into the API-key entry-lease API.
 	check("claiming a provider sweep succeeds independently", claimSweepLease("sweep-only", leaseConfig) === true);
-	check("a provider sweep is not an entry lease", leasedByOthers("sweep-only", 3, leaseConfig).size === 0);
-	check("a provider sweep has no entry owner", leaseOwner("sweep-only", 0, leaseConfig) === undefined);
+	check(
+		"a provider sweep is not an entry lease",
+		leasedByOthers("sweep-only", ["k0", "k1", "k2"], leaseConfig).size === 0,
+	);
+	check("a provider sweep has no entry owner", leaseOwner("sweep-only", "k0", leaseConfig) === undefined);
 
 	// Clean shutdown releases this process's provider sweep too.
 	claimSweepLease("cleanup-sweep", leaseConfig);

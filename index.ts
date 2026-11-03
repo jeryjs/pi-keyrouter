@@ -354,6 +354,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			kind: providerCfg.kind,
 			// Only meaningful for OAuth pools; false for keys pools by construction.
 			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
+			sweepRefresh: providerCfg.kind === "oauth" && providerCfg.sweepRefresh === true,
 			strategy: providerCfg.strategy ?? "failover",
 			keys:
 				providerCfg.kind === "oauth"
@@ -1228,8 +1229,18 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		const MIN_VALIDITY_MS = 5 * 60 * 1000;
 		const REFRESH_TIMEOUT_MS = 15_000;
 		const now = Date.now();
+		// The internal override sweeps every OAuth pool; without it, only the pools
+		// that asked for it in the config are swept.
+		const sweepAll = startupSweepEnabled(process.env);
 		for (const rt of runtimes.values()) {
 			if (rt.kind !== "oauth" || rt.currentIndex < 0) continue;
+			// The sweep is opt-in per pool: the config says `sweepRefresh: true`. It
+			// exchanges a refresh token per idle account, and that exchange is not
+			// race-free yet (TODO.md), so it stays off unless it is asked for.
+			if (!rt.sweepRefresh && !sweepAll) {
+				trace(`sweep skip ${rt.providerId} (sweepRefresh is not enabled for this pool)`);
+				continue;
+			}
 			// pi's own refresh implementation, reached exactly the way `skipReason`
 			// reads the provider: through the registry facade, capability-checked.
 			// The registry-facing contract is `refresh` — pi-ai's OAuthAuth — for
@@ -1491,14 +1502,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		await reconcileCredentials();
 		await activate(ctx);
 		// Keep idle pool accounts alive without holding up the session: the sweep
-		// never touches pi's store, so it cannot race the first turn.
-		if (startupSweepEnabled(process.env)) {
-			void sweepIdleAccounts(ctx).catch((error) => {
-				trace(`sweep error ${error instanceof Error ? error.message : String(error)}`);
-			});
-		} else {
-			trace("startup sweep skipped (PI_KEYROUTER_SWEEP is not set to 1)");
-		}
+		// never touches pi's store, so it cannot race the first turn. Every pool
+		// is checked: only the ones whose config says `sweepRefresh: true` are
+		// swept, and the rest are skipped.
+		void sweepIdleAccounts(ctx).catch((error) => {
+			trace(`sweep error ${error instanceof Error ? error.message : String(error)}`);
+		});
 	});
 
 	// Lazy bootstrap: also fire on every turn. This handles /reload (which
