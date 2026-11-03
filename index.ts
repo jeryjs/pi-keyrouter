@@ -604,8 +604,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 */
 	function releaseLeases(): void {
 		for (const rt of runtimes.values()) {
-			releaseLease(rt.providerId, rt.claimed);
-			rt.claimed = -1;
+			releaseCurrentLease(rt);
 		}
 	}
 
@@ -1117,11 +1116,20 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			//    what a later return to this account will install.
 			await captureAccount(rt, entry);
 		} else {
-			if (!(await applyKey(rt.providerId, entry.value, ctx))) return undefined;
+			// Claim the entry BEFORE installing it: a claim taken after the install
+			// leaves a window in which another process picks the same credential.
+			// The claim is a preference, so losing the race is not fatal — the
+			// request still goes out.
+			const previous = rt.claimedName;
+			takeLease(rt, idx);
+			if (!(await applyKey(rt.providerId, entry.value, ctx))) {
+				// The install failed, so this process never moved off the entry it
+				// had: its claim goes back where it belongs.
+				restoreLease(rt, previous);
+				return undefined;
+			}
 			setActive(rt, idx);
 			recordUse(entry);
-			// The entry is now the one this process uses: hold the lease on it.
-			takeLease(rt, idx);
 		}
 		return entry;
 	}
@@ -1388,12 +1396,16 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 
 			setActive(rt, idx);
 			recordUse(key);
+			// Claim before installing (see the rotation path): the claim must exist
+			// before another process can see the entry as free.
+			takeLease(rt, idx);
 			// This is the fix for the old bug: the initial key actually gets set.
 			if (await applyKey(providerId, key.value, ctx)) {
 				newlyBootstrapped++;
-				// Hold the lease on the entry this process just took.
-				takeLease(rt, idx);
 				trace(`bootstrap ${providerId} -> ${key.name}`);
+			} else {
+				// Nothing was installed, so nothing is claimed either.
+				releaseCurrentLease(rt);
 			}
 		}
 		// Only notify on first activation (when we installed anything)
@@ -1600,6 +1612,10 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				// Keys pool: drop the override so pi falls back to the user's own
 				// credential, then let pi surface the real error.
 				if (rt.injecting) await clearKey(providerId);
+				// The override is gone, so this process is no longer using that
+				// entry: drop the claim too, or the entry stays blocked for every
+				// other process until the next rotation.
+				releaseCurrentLease(rt);
 				trace(`exhausted ${providerId} failed=[${failed.join(", ")}]`);
 			}
 			if (uiCtx) notifyExhausted(uiCtx, providerId, failed, rt.kind);
@@ -1972,6 +1988,9 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				setActive(rt, idx);
 				rt.pendingContinue = false;
 				recordUse(entry);
+				// The claim follows the credential this process now uses, so other
+				// processes keep off it and the old entry is free again.
+				takeLease(rt, idx);
 				const noun = rt.kind === "oauth" ? "account" : "key";
 				trace(`manual ${providerId} ${previous ?? "(none)"} -> ${entry.name} (/${noun})`);
 				ctx.ui.notify(
