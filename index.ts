@@ -2179,7 +2179,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				// is holding right now, so the user signs in with pi's own /login and
 				// keyrouter takes a copy afterwards. Removing asks for confirmation,
 				// because the credential is deleted from the config file.
-				if (!config || runtimes.size === 0) await activate(ctx);
+				// Read the config from disk instead of reusing the session's copy: the
+				// pool the user is aiming at may have been added to the file since the
+				// session started. Do NOT activate here — installing a pool account
+				// would overwrite the login the user just made, which is exactly what
+				// an OAuth `add` is meant to capture.
+				config = loadConfig(ctx.cwd);
 				const wanted = parsed.args[0];
 				if (!wanted) {
 					ctx.ui.notify(`🔑 keyrouter: usage — /keyrouter ${parsed.usage}`, "warning");
@@ -2220,7 +2225,8 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					}
 					const confirmed = await ctx.ui.confirm(
 						`Remove ${entry.name} from ${pool.name}?`,
-						"The credential is deleted from keyrouter.json. pi's own login is not touched.",
+						"The credential is deleted from keyrouter.json. keyrouter keeps managing this provider, " +
+							"so pi keeps using the pool's credential for it.",
 					);
 					if (!confirmed) {
 						ctx.ui.notify("🔑 keyrouter: nothing removed.", "info");
@@ -2258,13 +2264,33 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						return;
 					}
 
-					// An explicit existing name means UPDATE THAT ENTRY IN PLACE.
-					const existing = requestedName
-						? (pool.keys ?? []).find((entry) => entry.name === requestedName)
-						: undefined;
-					if (existing) {
+					// The plan decides what happens: an explicitly named existing entry
+					// is updated, a key the pool already holds is refused, and only a
+					// genuinely new key is added.
+					const plan = planKeyAddition({
+						value,
+						requestedName,
+						entries: pool.keys ?? [],
+					});
+					if (plan.kind === "ambiguous") {
+						ctx.ui.notify(
+							`🔑 keyrouter: "${requestedName}" matches more than one entry in ${pool.name} ` +
+								`(${plan.names.join(", ")}). Rename one of them first.`,
+							"warning",
+						);
+						return;
+					}
+					if (plan.kind === "duplicate") {
+						ctx.ui.notify(
+							`🔑 keyrouter: "${plan.name}" in ${pool.name} already holds that key — nothing added. ` +
+								`Use /keyrouter add ${pool.name} ${plan.name} to replace it.`,
+							"warning",
+						);
+						return;
+					}
+					if (plan.kind === "update") {
 						const updated = writeBackPoolEntry(pool.name, "update", {
-							name: existing.name,
+							name: plan.name,
 							value,
 						});
 						if ("error" in updated) {
@@ -2276,20 +2302,19 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 						}
 						if (updated.updated === 0) {
 							ctx.ui.notify(
-								`🔑 keyrouter: "${existing.name}" in ${pool.name} is already up to date.`,
+								`🔑 keyrouter: "${plan.name}" in ${pool.name} is already up to date.`,
 								"info",
 							);
 							return;
 						}
 						await reloadAll(ctx);
-						trace(`update ${pool.name} ${existing.name}`);
-						ctx.ui.notify(`🔑 keyrouter: updated ${existing.name} in ${pool.name}.`, "info");
+						trace(`update ${pool.name} ${plan.name}`);
+						ctx.ui.notify(`🔑 keyrouter: updated ${plan.name} in ${pool.name}.`, "info");
 						return;
 					}
 
-					const base = requestedName ?? `key-${entries.length + 1}`;
 					const generated = uniquePoolEntryName(
-						base,
+						plan.name,
 						entries.map((entry) => entry.name),
 					);
 					const added = writeBackPoolEntry(pool.name, "add", {
@@ -2310,7 +2335,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 					await reloadAll(ctx);
 					if (generated.adjusted) {
 						ctx.ui.notify(
-							`🔑 keyrouter: adjusted the generated name to "${generated.name}" because "${base}" is already in use.`,
+						`🔑 keyrouter: adjusted the generated name to "${generated.name}" because "${plan.name}" is already in use.`,
 							"warning",
 						);
 					}
@@ -2323,14 +2348,18 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				}
 
 				// OAuth: pi owns the login, so the credential is taken from pi.
-				if (!storeApi) {
+				// The credential store is probed here instead of being taken from
+				// `activate()`: this command deliberately does not activate a pool (see
+				// above), but it still needs the credential pi is holding right now.
+				const store = storeApi ?? credentialsStore(ctx.modelRegistry, ctx.ui);
+				if (!store) {
 					ctx.ui.notify(
 						"🔑 keyrouter: pi's credential store is unavailable in this build — cannot capture an account.",
 						"warning",
 					);
 					return;
 				}
-				const credential = await captureCredential(storeApi, providerId);
+				const credential = await captureCredential(store, providerId);
 				if (!credential) {
 					ctx.ui.notify(
 						`🔑 keyrouter: pi has no login for ${providerId}. Run /login first, then /keyrouter add ${pool.name}.`,
@@ -2536,6 +2565,47 @@ export type OAuthAdditionPlan =
 	| { kind: "ambiguous"; names: string[] }
 	| { kind: "add"; name: string | undefined };
 
+/** The decision made after `/keyrouter add` reads an API key for a keys pool. */
+export type KeyAdditionPlan =
+	| { kind: "update"; name: string }
+	| { kind: "duplicate"; name: string }
+	| { kind: "ambiguous"; names: string[] }
+	| { kind: "add"; name: string };
+
+/**
+ * Plan an API-key addition without touching the TUI.
+ *
+ * The order mirrors the OAuth plan: an explicitly named existing entry is
+ * updated, a name that matches only case-insensitively names the same entry to
+ * the user (and is updated too, unless two entries match, which is refused),
+ * and a key the pool already holds is refused instead of being added twice.
+ */
+export function planKeyAddition(args: {
+	value: string;
+	requestedName?: string | undefined;
+	entries: ReadonlyArray<{ name: string; value: string }>;
+}): KeyAdditionPlan {
+	const { value, requestedName, entries } = args;
+	if (requestedName) {
+		const exact = entries.find((entry) => entry.name === requestedName);
+		if (exact) return { kind: "update", name: exact.name };
+		const insensitive = entries.filter(
+			(entry) => entry.name.toLowerCase() === requestedName.toLowerCase(),
+		);
+		if (insensitive.length > 1) {
+			return { kind: "ambiguous", names: insensitive.map((entry) => entry.name) };
+		}
+		const only = insensitive[0];
+		if (only) return { kind: "update", name: only.name };
+	}
+	// The same key under a second name is a duplicate, not a new entry: the pool
+	// would then rotate onto one credential twice and waste a slot on a key it
+	// already holds.
+	const duplicate = entries.find((entry) => entry.value === value);
+	if (duplicate) return { kind: "duplicate", name: duplicate.name };
+	return { kind: "add", name: requestedName ?? `key-${entries.length + 1}` };
+}
+
 /**
  * Plan an OAuth addition without touching the TUI.
  *
@@ -2551,10 +2621,21 @@ export function planOAuthAddition(args: {
 	identityPath?: string | undefined;
 }): OAuthAdditionPlan {
 	const { credential, accounts, requestedName, identityPath } = args;
-	const explicitTarget = requestedName
+	const exactTarget = requestedName
 		? accounts.find((account) => account.name === requestedName)
 		: undefined;
-	if (explicitTarget) return { kind: "update", target: explicitTarget };
+	if (exactTarget) return { kind: "update", target: exactTarget };
+	// A name that matches only case-insensitively names the same entry to the
+	// user. Two such matches are ambiguous: picking one of them would replace a
+	// credential the user did not name.
+	const insensitiveTargets = requestedName
+		? accounts.filter((account) => account.name.toLowerCase() === requestedName.toLowerCase())
+		: [];
+	if (insensitiveTargets.length > 1) {
+		return { kind: "ambiguous", names: insensitiveTargets.map((account) => account.name) };
+	}
+	const onlyTarget = insensitiveTargets[0];
+	if (onlyTarget) return { kind: "update", target: onlyTarget };
 
 	const duplicate = accounts.find((account) => sameCredential(account.credential, credential));
 	if (duplicate) return { kind: "duplicate", name: duplicate.name };
