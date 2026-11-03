@@ -779,8 +779,10 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				})
 				.filter((k): k is ApiKey => k !== undefined);
 			if (keys.length === 0) {
-				warnings.push(`"${raw.name}": no usable keys after expansion — pool dropped.`);
-				continue;
+				// The pool is KEPT, not dropped: an empty pool is how a pool looks
+				// before its first entry is added, and `/keyrouter add` has to be
+				// able to find it there. It installs nothing until it has a key.
+				warnings.push(`"${raw.name}": no usable keys after expansion — the pool is empty.`);
 			}
 			if (raw.identityPath !== undefined) {
 				// Identity attribution only ever happens for an OAuth pool, where a
@@ -820,8 +822,9 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				accounts.push({ name: item.name, credential: parsed.credential });
 			}
 			if (accounts.length === 0) {
-				warnings.push(`"${raw.name}": no usable accounts — pool dropped.`);
-				continue;
+				// Kept, not dropped — see the keys branch above: an empty pool is
+				// where `/keyrouter add` puts the first account.
+				warnings.push(`"${raw.name}": no usable accounts — the pool is empty.`);
 			}
 
 			// Where this provider's account identity lives. Checked for structural

@@ -303,7 +303,35 @@ try {
 
 	// An OAuth pool with no usable accounts is dropped entirely.
 	writeFileSync(cfgFile, JSON.stringify({ providers: [{ name: "cline", accounts: [] }] }), "utf8");
-	check("an OAuth pool with no accounts is dropped", loadConfig().providers.length === 0);
+	const emptyPool = loadConfig();
+	check("an OAuth pool with no accounts is kept", emptyPool.providers.length === 1);
+	check("an empty OAuth pool has no accounts", emptyPool.providers[0]?.accounts?.length === 0);
+	check(
+		"an empty pool is reported",
+		(emptyPool.warnings ?? []).some((w) => /no usable accounts/.test(w)),
+	);
+	writeFileSync(cfgFile, JSON.stringify({ providers: [{ name: "cline", keys: [] }] }), "utf8");
+	const emptyKeys = loadConfig();
+	check("a keys pool with no keys is kept", emptyKeys.providers.length === 1);
+
+	// Two pools with the same name are the same pool (provider ids are matched
+	// case-insensitively): the first one wins and the rest are reported.
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({
+			providers: [
+				{ name: "dup", keys: [{ name: "a", value: "sk-1" }] },
+				{ name: "dup", keys: [{ name: "b", value: "sk-2" }] },
+			],
+		}),
+		"utf8",
+	);
+	const duplicatePool = loadConfig();
+	check("a duplicate pool name keeps only the first pool", duplicatePool.providers.length === 1);
+	check(
+		"a duplicate pool name is reported",
+		(duplicatePool.warnings ?? []).some((w) => /duplicate pool name/.test(w)),
+	);
 
 	// notifications — which events earn a visible status line. The policy
 	// functions are pure; the notify wrappers are exercised with a fake UI so
