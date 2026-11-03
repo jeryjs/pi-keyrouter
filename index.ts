@@ -1432,6 +1432,13 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	 * again, and bootstrap from it.
 	 */
 	async function reloadAll(ctx: ExtensionContext): Promise<void> {
+		// Remember what each entry has learned in this session. A reload replaces
+		// the runtime state, and a pool that is merely being edited must not lose
+		// the cooldowns, the failure counts and the usage counts it earned.
+		const learned = new Map<string, Map<string, KeyState>>();
+		for (const [providerId, rt] of runtimes) {
+			learned.set(providerId, new Map(rt.keys.map((key) => [key.name, key])));
+		}
 		if (credentialApi) {
 			for (const providerId of [...injected]) await clearKey(providerId);
 		}
@@ -1456,6 +1463,22 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		storeApi = undefined;
 		lastErrorNotified = false;
 		await activate(ctx);
+		// Carry the learned state over to the rebuilt runtime, entry by entry, and
+		// only where the credential itself did not change: a replaced key is a
+		// different credential and starts untried.
+		for (const [providerId, rt] of runtimes) {
+			const prior = learned.get(providerId);
+			if (!prior) continue;
+			for (const key of rt.keys) {
+				const old = prior.get(key.name);
+				if (!old || old.value !== key.value) continue;
+				key.lastStatus = old.lastStatus;
+				key.cooldownUntil = old.cooldownUntil;
+				key.overloadedUntil = old.overloadedUntil;
+				key.uses = old.uses;
+				key.failures = old.failures;
+			}
+		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
