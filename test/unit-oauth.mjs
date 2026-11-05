@@ -69,6 +69,26 @@ const VALID = {
 	accountId: "provider-specific-field",
 };
 
+const CONFIG_SCHEMA_URL =
+	"https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json";
+
+const CONFIG_SCHEMA = JSON.parse(readFileSync(new URL("../schema.json", import.meta.url), "utf8"));
+
+check("the JSON Schema uses Draft 2020-12", CONFIG_SCHEMA.$schema === "https://json-schema.org/draft/2020-12/schema");
+check(
+	"the JSON Schema points at the canonical raw URL",
+	CONFIG_SCHEMA.properties?.$schema?.const === CONFIG_SCHEMA_URL,
+);
+check(
+	"the JSON Schema covers both pool kinds and both credential forms",
+	CONFIG_SCHEMA.$defs?.provider?.oneOf?.length === 2 &&
+		Boolean(
+			CONFIG_SCHEMA.$defs?.apiKeyEntry &&
+				CONFIG_SCHEMA.$defs?.accountEntry &&
+				CONFIG_SCHEMA.$defs?.oauthCredential,
+		),
+);
+
 // ---------------------------------------------------------------------------
 // 1. credentialStore capability guard
 // ---------------------------------------------------------------------------
@@ -223,6 +243,7 @@ try {
 		cfgFile,
 		JSON.stringify(
 			{
+				$schema: CONFIG_SCHEMA_URL,
 				providers: [
 					{
 						name: "cline",
@@ -253,6 +274,7 @@ try {
 	const byName = Object.fromEntries(cfg.providers.map((p) => [p.name, p]));
 
 	check("loadConfig produced three pools", cfg.providers.length === 3, String(cfg.providers.length));
+	check("an optional $schema reference is accepted and ignored", cfg.providers.length === 3 && !("$schema" in cfg));
 	check("oauth pool has kind=oauth", byName.cline?.kind === "oauth");
 	check("keys pool has kind=keys", byName.google?.kind === "keys");
 	check("oauth pool kept the two usable accounts", byName.cline?.accounts?.length === 2, String(byName.cline?.accounts?.length));
@@ -956,6 +978,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	// --- notifications: the top-level status-line volume ----------------
 	const notificationFile = join(persistDir, "notifications.json");
 	const notificationSeed = {
+		$schema: CONFIG_SCHEMA_URL,
 		providers: [{ name: "google", keys: [{ name: "primary", value: "$GOOGLE_KEY" }] }],
 		notifications: "all",
 		maxRetries: 3,
@@ -972,6 +995,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	check(
 		"write-back preserves every other top-level field",
 		quietConfig.maxRetries === 3 &&
+			quietConfig.$schema === notificationSeed.$schema &&
 			quietConfig._customTopLevelField.keep === true &&
 			JSON.stringify(quietConfig.providers) === JSON.stringify(notificationSeed.providers),
 	);

@@ -10,8 +10,11 @@
 //   - Windows: %USERPROFILE%\.pi\keyrouter.json
 //   - macOS/Linux: ~/.pi/keyrouter.json
 //
+// The optional `$schema` reference below enables IDE completion and validation.
+// Existing configuration files do not need it and are never migrated.
 // Schema — API-key pool:
 // {
+//   "$schema": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
 //   "providers": [
 //     {
 //       "name": "google",

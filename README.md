@@ -67,6 +67,7 @@ credentials that must not be overridable by a repo you clone.
 
 ```json5
 {
+  "$schema": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
   "providers": [
     {
       // Provider id as pi knows it: built-in ("google"), models.json, or
@@ -94,6 +95,11 @@ credentials that must not be overridable by a repo you clone.
   "notifications": "all"      // status-line volume: "all" | "quiet" | "silent"
 }
 ```
+
+The optional `$schema` property enables schema-aware completion, hover documentation, and validation in
+editors that support JSON Schema. It is safe to add to an existing config: keyrouter ignores it at
+runtime and preserves it when writing the file back. keyrouter does not add it, migrate the file, or
+send a notification about it; existing configurations continue to work unchanged.
 
 `$NAME` / `${NAME}` expand from the environment at load time. A key whose variable is missing is
 dropped; if that empties the pool, the provider is skipped with a warning.
@@ -669,6 +675,7 @@ Useful runner flags: `node test/run.mjs rotate` (filter), `oauth-` (just the OAu
 index.ts          entry point: events, rotation, continuation
 rotation.ts       pure key-pick / cooldown logic
 config.ts         config load, $ENV expansion, path override
+schema.json        JSON Schema for IDE completion and validation
 types.ts          shared types
 notification.ts   ui.notify lines
 test/

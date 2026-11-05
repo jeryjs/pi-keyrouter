@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
+  "title": "pi-keyrouter configuration",
+  "description": "Configuration for pi-keyrouter credential pools. This schema is intended for ~/.pi/keyrouter.json and provides IDE completion, hover documentation, and validation without changing keyrouter's runtime behavior.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
+      "default": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
+      "description": "Optional JSON Schema reference. Put this property first in ~/.pi/keyrouter.json to enable schema-aware completion and validation in editors that support JSON Schema. keyrouter does not add or migrate this property for existing configurations.",
+      "examples": [
+        "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json"
+      ]
+    },
+    "providers": {
+      "type": "array",
+      "description": "Credential pools, one per provider id. Each pool contains either API keys or OAuth accounts, never both.",
+      "items": {
+        "$ref": "#/$defs/provider"
+      },
+      "default": []
+    },
+    "maxRetries": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 3,
+      "description": "Maximum number of credential rotations keyrouter may make for one provider during a request. Rotation still stops as soon as a credential succeeds."
+    },
+    "cooldownMs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 60000,
+      "description": "How long, in milliseconds, a credential stays marked bad after a rate-limit or authorization failure."
+    },
+    "overloadedCooldownMs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 30000,
+      "description": "How long, in milliseconds, a provider stays marked overloaded after an overloaded response such as HTTP 529. This is provider-wide and does not count as a credential failure."
+    },
+    "notifications": {
+      "$ref": "#/$defs/notificationLevel"
+    }
+  },
+  "required": [
+    "providers"
+  ],
+  "additionalProperties": true,
+  "examples": [
+    {
+      "$schema": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
+      "providers": [
+        {
+          "name": "tokenharbor",
+          "keys": [
+            {
+              "name": "primary",
+              "value": "$TOKENHARBOR_API_KEY"
+            },
+            {
+              "name": "backup",
+              "value": "$TOKENHARBOR_API_KEY_BACKUP"
+            }
+          ],
+          "strategy": "round-robin"
+        }
+      ],
+      "maxRetries": 3,
+      "cooldownMs": 60000,
+      "overloadedCooldownMs": 30000,
+      "notifications": "all"
+    },
+    {
+      "$schema": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
+      "providers": [
+        {
+          "name": "cline",
+          "accounts": [
+            {
+              "name": "work",
+              "credential": "$CLINE_WORK_CREDENTIAL"
+            },
+            {
+              "name": "home",
+              "credential": "@~/.pi/accounts/cline-home.json"
+            },
+            {
+              "name": "inline",
+              "credential": {
+                "type": "oauth",
+                "access": "access-token",
+                "refresh": "refresh-token",
+                "expires": 1791056623000
+              }
+            }
+          ],
+          "rotateOnQuota": true,
+          "strategy": "stalest-first",
+          "identityPath": "access:email"
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "description": "One provider's credential pool.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Provider id as pi knows it: a built-in id such as google or anthropic, a models.json id, or an id registered by another extension. Provider ids are matched case-insensitively."
+        },
+        "keys": {
+          "type": "array",
+          "description": "API keys in this pool. An empty list is allowed so the pool can be filled later with /keyrouter add. Mutually exclusive with accounts.",
+          "items": {
+            "$ref": "#/$defs/apiKeyEntry"
+          },
+          "default": []
+        },
+        "accounts": {
+          "type": "array",
+          "description": "OAuth logins in this pool. An empty list is allowed so the pool can be filled later with /keyrouter add. Mutually exclusive with keys.",
+          "items": {
+            "$ref": "#/$defs/accountEntry"
+          },
+          "default": []
+        },
+        "match": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "deprecated": true,
+          "description": "Legacy URL substrings. Accepted for backward compatibility but ignored; rotation is keyed by provider id instead."
+        },
+        "takeoverOAuth": {
+          "type": "boolean",
+          "default": false,
+          "description": "For a keys pool, inject pooled API keys even when pi already has a stored OAuth login for this provider. Off by default because a runtime API key shadows the stored login. Only applies to keys pools."
+        },
+        "rotateOnQuota": {
+          "type": "boolean",
+          "default": true,
+          "description": "For an accounts pool, rotate when an account-level quota or billing error is reported. Defaults to true because separate OAuth accounts are separate subscriptions. Only applies to accounts pools."
+        },
+        "strategy": {
+          "$ref": "#/$defs/rotationStrategy"
+        },
+        "active": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the entry that was active when the last session ended. keyrouter writes and updates this field so rotation resumes across sessions; leave it out when creating a pool."
+        },
+        "identityPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!\\s*:)(?![^:]*:\\s*$).+$",
+          "description": "Where this provider's account identity lives inside an OAuth credential. The format is level1 or level1:level2; level1 names a credential field (or dotted path), and level2 is a path into that value after automatic JWT, JSON, or base64 decoding. Examples: refresh, access:email, access:user.email, accountId:sub. Only applies to accounts pools."
+        },
+        "sweepRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Refresh this pool's idle OAuth accounts at session start so their tokens do not remain expired until a request needs one. Opt in per pool. Only applies to accounts pools."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "keys"
+          ],
+          "properties": {
+            "accounts": false,
+            "rotateOnQuota": false,
+            "identityPath": false,
+            "sweepRefresh": false
+          }
+        },
+        {
+          "required": [
+            "accounts"
+          ],
+          "properties": {
+            "keys": false,
+            "takeoverOAuth": false
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "apiKeyEntry": {
+      "type": "object",
+      "description": "A named API key in a keys pool.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable name for this credential. keyrouter uses the name in status and trace output, never the key value."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The API key, either as a literal or as an environment reference in the form $NAME or ${NAME}. Environment references are expanded when the configuration loads; prefer them so secrets are not stored on disk."
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": true
+    },
+    "accountEntry": {
+      "type": "object",
+      "description": "A named OAuth login in an accounts pool.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable name for this account. keyrouter uses the name in status and trace output, never credential values."
+        },
+        "credential": {
+          "$ref": "#/$defs/accountCredential"
+        }
+      },
+      "required": [
+        "name",
+        "credential"
+      ],
+      "additionalProperties": true
+    },
+    "accountCredential": {
+      "description": "An OAuth credential stored inline, in an environment variable, or in a JSON file. Inline credentials require type oauth, a non-empty access token, a refresh token, and a numeric expires timestamp in epoch milliseconds.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/oauthCredential"
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?:@.+|\\$(?:\\{[A-Za-z_][A-Za-z0-9_]*\\}|[A-Za-z_][A-Za-z0-9_]*)$|\\s*\\{)",
+          "description": "An external credential source: @path points to a JSON file containing one credential object (a leading ~ is expanded), $NAME or ${NAME} reads a JSON credential object from an environment variable, and a string beginning with { is parsed as an inline JSON credential object."
+        }
+      ]
+    },
+    "oauthCredential": {
+      "type": "object",
+      "description": "An OAuth credential. Provider-specific fields such as accountId, projectId, clientId, clientSecret, region, machineID, userID, and availableModelIds are preserved and are therefore allowed.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "oauth",
+          "description": "Credential type. keyrouter only pools OAuth credentials."
+        },
+        "access": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Current OAuth access token."
+        },
+        "refresh": {
+          "type": "string",
+          "minLength": 1,
+          "description": "OAuth refresh token used by pi when the access token needs renewal."
+        },
+        "expires": {
+          "type": "integer",
+          "description": "Access-token expiry as epoch milliseconds. pi refreshes the credential when fewer than about five minutes remain."
+        }
+      },
+      "required": [
+        "type",
+        "access",
+        "refresh",
+        "expires"
+      ],
+      "additionalProperties": true
+    },
+    "rotationStrategy": {
+      "type": "string",
+      "enum": [
+        "failover",
+        "round-robin",
+        "stalest-first",
+        "random"
+      ],
+      "default": "failover",
+      "enumDescriptions": [
+        "Stay on the current entry until it fails. This is the default and the historical behavior.",
+        "Advance to the next entry at every turn boundary, spreading usage across the pool.",
+        "Choose the available account whose token expires soonest. Accounts pools only; a keys pool degrades to round-robin with a warning.",
+        "Choose a uniformly random available entry at each turn boundary."
+      ],
+      "description": "How the next healthy entry is selected at a turn boundary. Failure rotation still happens on top of this setting."
+    },
+    "notificationLevel": {
+      "type": "string",
+      "enum": [
+        "all",
+        "quiet",
+        "silent"
+      ],
+      "default": "all",
+      "enumDescriptions": [
+        "Show every rotation and provider-overload notification.",
+        "Hide routine rate-limit rotations and overload notices, but keep notifications that need action.",
+        "Hide rotation and overload notices. Pool exhaustion still notifies because the request has failed."
+      ],
+      "description": "How much keyrouter status output reaches the user. This changes notifications only; it does not change rotation behavior."
+    }
+  }
+}

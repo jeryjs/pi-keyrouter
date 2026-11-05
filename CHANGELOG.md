@@ -20,6 +20,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **JSON Schema support for `~/.pi/keyrouter.json`.** The new `schema.json` describes every supported
+  pool, credential, strategy, and notification setting for IDE completion, hover documentation, and
+  validation. Add `"$schema": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json"`
+  as the first property to enable it. The reference is optional: existing configurations are intentionally
+  left untouched, with no migration, rewrite, or notification.
+
 ## [1.8.0] — 2026-11-03
 
 ### Added
