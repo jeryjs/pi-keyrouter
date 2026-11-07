@@ -29,7 +29,7 @@
 //
 // Usage:
 //   pi install npm:pi-keyrouter      # or: pi -e <path-to-this-folder>
-//   # create ~/.pi/keyrouter.json with your provider keys
+//   # create ~/.pi/agent/pi-keyrouter.json with your provider keys
 //   /reload
 
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
@@ -38,6 +38,9 @@ import { appendFileSync, existsSync } from "node:fs";
 import {
 	loadConfig,
 	configPath,
+	legacyConfigPath,
+	migrateLegacyConfig,
+	needsLegacyConfigMigration,
 	writeBackCredentials,
 	writeBackActive,
 	writeBackNotifications,
@@ -1336,6 +1339,19 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 	async function activate(ctx: ExtensionContext): Promise<void> {
 		// Load config once (reload clears it)
 		if (!config) {
+			// One-time move of the pre-migration config location. The notice is
+			// queued (there may be no UI yet) and flushed below with the other
+			// bootstrap warnings, so the session that moves the file is the one
+			// that says so.
+			if (needsLegacyConfigMigration()) {
+				warn(
+					undefined,
+					earlyWarnings,
+					`🔑 keyrouter: the config has moved from ${legacyConfigPath()} to ${configPath()} — ` +
+						"your file was moved to the new location.",
+				);
+				if (!migrateLegacyConfig()) trace(`legacy config migration failed (${legacyConfigPath()})`);
+			}
 			config = loadConfig(ctx.cwd);
 		}
 		if (config.providers.length === 0) return;
@@ -1748,7 +1764,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		// its provider claim — it releases it when it finishes, and releasing it
 		// here would let another session sweep the same provider in parallel.
 		releaseLeases();
-		releaseOwnLeases(undefined, sweepingProviders);
+		releaseOwnLeases(sweepingProviders);
 		runtimes.clear();
 		skipReported.clear();
 		permanentSkip.clear();
@@ -1816,7 +1832,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 				}
 				if (!config || config.providers.length === 0) {
 					ctx.ui.notify(
-						`🔑 keyrouter: not active — no ~/.pi/keyrouter.json found ` +
+						`🔑 keyrouter: not active — no config found ` +
 							`(expected at ${configPath()}). Config is user-level only, never project-scoped.`,
 						"warning",
 					);

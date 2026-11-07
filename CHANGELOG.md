@@ -28,6 +28,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the first property to enable it. The reference is optional: existing configurations are intentionally
   left untouched, with no migration, rewrite, or notification.
 
+### Changed
+
+- **The config moved into pi's agent directory.** The pool file now lives at `~/.pi/agent/pi-keyrouter.json`
+  (pi's `getAgentDir()`, so a custom `PI_CODING_AGENT_DIR` is honoured), and the lease files moved to the
+  hidden `~/.pi/agent/extensions/.pi-keyrouter-leases/`. On the first start after updating, keyrouter
+  announces the move and relocates an existing `~/.pi/keyrouter.json` to the new location — a rename, so
+  nothing is left behind, and a `PI_KEYROUTER_CONFIG` override is never touched. The override still selects
+  the config file; the leases follow the agent dir rather than the override.
+
 ## [1.8.0] — 2026-11-03
 
 ### Added

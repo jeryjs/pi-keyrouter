@@ -25,6 +25,9 @@ const {
 	loadConfig,
 	expandEnv,
 	configPath,
+	legacyConfigPath,
+	migrateLegacyConfig,
+	needsLegacyConfigMigration,
 	writeBackActive,
 	writeBackNotifications,
 	writeBackPoolEntry,
@@ -894,6 +897,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	// The earlier sections already removed their temp dir, so this block owns a
 	// separate one: a write test must never share (or rely on) another fixture.
 	const persistDir = mkdtempSync(join(tmpdir(), "kr-unit-persist-"));
+	const lockAgentDir = join(persistDir, "agent");
 	try {
 
 	// An inline-object account gets the refreshed values merged in; the sibling
@@ -921,6 +925,9 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	writeFileSync(persistFile, JSON.stringify(seed, null, 2) + "\n", "utf8");
 
 	process.env.PI_KEYROUTER_CONFIG = persistFile;
+	// The config write lock lives in the lease directory, which follows pi's
+	// agent dir — point that at the fixture too, never at the user's own ~/.pi.
+	process.env.PI_CODING_AGENT_DIR = lockAgentDir;
 	const updated = writeBackCredentials(
 		new Map([["cline\u0000a1", { type: "oauth", access: "new-access", refresh: "refresh-1", expires: 9999 }]]),
 	);
@@ -1055,7 +1062,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 	// the properties below are the whole contract: it is released, a dead
 	// writer's lock is reclaimed, and a live one is waited out rather than
 	// allowed to block the session.
-	const lockDir = join(persistDir, "keyrouter-leases");
+	const lockDir = join(lockAgentDir, "extensions", ".pi-keyrouter-leases");
 	const lockFile = join(lockDir, "config.lock");
 
 	check("a successful write leaves no lock behind", writeBackActive("cline", "a3").updated === 1);
@@ -1278,6 +1285,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 
 	delete process.env.PI_KEYROUTER_CONFIG;
 	} finally {
+		if (process.env.PI_CODING_AGENT_DIR === lockAgentDir) delete process.env.PI_CODING_AGENT_DIR;
 		rmSync(persistDir, { recursive: true, force: true });
 	}
 }
@@ -1291,6 +1299,7 @@ check("sameCredential is null-safe", sameCredential(undefined, undefined) && !sa
 // rotation.ts and stays pure, so it is tested here as a plain argument.
 // ---------------------------------------------------------------------------
 const leaseHome = mkdtempSync(join(tmpdir(), "kr-unit-lease-"));
+process.env.PI_CODING_AGENT_DIR = leaseHome;
 try {
 	const {
 		claimLease,
@@ -1302,21 +1311,20 @@ try {
 		leaseOwner,
 		sweepLeaseOwner,
 	} = await import("../lease.ts");
-	// The leases live next to the config file, so a test points them at a
-	// throwaway config rather than at the user's own ~/.pi.
-	const leaseConfig = join(leaseHome, "keyrouter.json");
-	const leaseDir = join(leaseHome, "keyrouter-leases");
+	// The leases live in pi's agent dir, so the test points PI_CODING_AGENT_DIR
+	// at a throwaway home rather than at the user's own ~/.pi.
+	const leaseDir = join(leaseHome, "extensions", ".pi-keyrouter-leases");
 
-	check("a fresh entry is free", leaseOwner("p", "k0", leaseConfig) === undefined);
-	check("claiming succeeds", claimLease("p", "k0", leaseConfig) === true);
-	check("the claim is ours", leaseOwner("p", "k0", leaseConfig) === process.pid);
-	check("claiming twice is still ours", claimLease("p", "k0", leaseConfig) === true);
+	check("a fresh entry is free", leaseOwner("p", "k0") === undefined);
+	check("claiming succeeds", claimLease("p", "k0") === true);
+	check("the claim is ours", leaseOwner("p", "k0") === process.pid);
+	check("claiming twice is still ours", claimLease("p", "k0") === true);
 	check(
 		"our own claim is not another process",
-		!leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(0),
+		!leasedByOthers("p", ["k0", "k1", "k2"]).has(0),
 	);
-	releaseLease("p", "k0", leaseConfig);
-	check("releasing frees the entry", leaseOwner("p", "k0", leaseConfig) === undefined);
+	releaseLease("p", "k0");
+	check("releasing frees the entry", leaseOwner("p", "k0") === undefined);
 
 	// Another LIVE process holds the entry: it must be invisible to us to take,
 	// and visible to the picker.
@@ -1324,27 +1332,27 @@ try {
 	writeFileSync(join(leaseDir, "p.k1.lease"), `${process.ppid}\n`, "utf8");
 	check(
 		"another live process holds the entry",
-		leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(1),
+		leasedByOthers("p", ["k0", "k1", "k2"]).has(1),
 	);
-	check("a held entry cannot be claimed", claimLease("p", "k1", leaseConfig) === false);
+	check("a held entry cannot be claimed", claimLease("p", "k1") === false);
 	check(
 		"releasing never steals somebody else's claim",
-		(releaseLease("p", "k1", leaseConfig), leaseOwner("p", "k1", leaseConfig) === process.ppid),
+		(releaseLease("p", "k1"), leaseOwner("p", "k1") === process.ppid),
 	);
 
 	// A DEAD process's claim is stale and may be taken over.
 	writeFileSync(join(leaseDir, "p.k2.lease"), "999999999\n", "utf8");
 	check(
 		"a dead owner's claim is stale",
-		!leasedByOthers("p", ["k0", "k1", "k2"], leaseConfig).has(2),
+		!leasedByOthers("p", ["k0", "k1", "k2"]).has(2),
 	);
-	check("a stale claim can be taken over", claimLease("p", "k2", leaseConfig) === true);
-	check("the taken-over claim is ours", leaseOwner("p", "k2", leaseConfig) === process.pid);
+	check("a stale claim can be taken over", claimLease("p", "k2") === true);
+	check("the taken-over claim is ours", leaseOwner("p", "k2") === process.pid);
 
 	// A claim belongs to the ENTRY, not to its position. Removing an entry from
 	// the pool shifts every later index, and an index-keyed claim would then
 	// protect the wrong credential — or none at all.
-	const shifted = leasedByOthers("p", ["k1", "k2"], leaseConfig);
+	const shifted = leasedByOthers("p", ["k1", "k2"]);
 	check(
 		"a claim follows its entry when the pool shifts",
 		shifted.has(0) && !shifted.has(1),
@@ -1359,13 +1367,13 @@ try {
 	writeFileSync(orphanFile, "999999999\n", "utf8");
 	check(
 		"a claim for an entry that is gone is not counted as leased",
-		!leasedByOthers("p", ["k1", "k2"], leaseConfig).has(9),
+		!leasedByOthers("p", ["k1", "k2"]).has(9),
 	);
 	check("a stale claim for a removed entry is cleaned up", !existsSync(orphanFile));
 
 	const liveOrphan = join(leaseDir, "p.k8.lease");
 	writeFileSync(liveOrphan, `${process.ppid}\n`, "utf8");
-	leasedByOthers("p", ["k1", "k2"], leaseConfig);
+	leasedByOthers("p", ["k1", "k2"]);
 	check("a live claim for a removed entry is left alone", existsSync(liveOrphan));
 	rmSync(liveOrphan, { force: true });
 
@@ -1387,48 +1395,49 @@ try {
 
 	// Provider-wide sweep claims are separate from entry leases: they guard a
 	// whole OAuth provider while its idle accounts are refreshed.
-	check("a fresh provider sweep claim is free", sweepLeaseOwner("sweep-provider", leaseConfig) === undefined);
-	check("claiming a provider sweep succeeds", claimSweepLease("sweep-provider", leaseConfig) === true);
-	check("the provider sweep claim is ours", sweepLeaseOwner("sweep-provider", leaseConfig) === process.pid);
-	check("claiming a provider sweep twice is still ours", claimSweepLease("sweep-provider", leaseConfig) === true);
-	releaseSweepLease("sweep-provider", leaseConfig);
-	check("releasing frees the provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === undefined);
+	check("a fresh provider sweep claim is free", sweepLeaseOwner("sweep-provider") === undefined);
+	check("claiming a provider sweep succeeds", claimSweepLease("sweep-provider") === true);
+	check("the provider sweep claim is ours", sweepLeaseOwner("sweep-provider") === process.pid);
+	check("claiming a provider sweep twice is still ours", claimSweepLease("sweep-provider") === true);
+	releaseSweepLease("sweep-provider");
+	check("releasing frees the provider sweep", sweepLeaseOwner("sweep-provider") === undefined);
 
 	// Another LIVE process holds the provider sweep: it is visible, but cannot
 	// be taken or stolen by release.
 	writeFileSync(join(leaseDir, "sweep-provider.sweep-lease"), `${process.ppid}\n`, "utf8");
-	check("another live process holds the provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === process.ppid);
-	check("a held provider sweep cannot be claimed", claimSweepLease("sweep-provider", leaseConfig) === false);
-	releaseSweepLease("sweep-provider", leaseConfig);
-	check("releasing never steals another process's provider sweep", sweepLeaseOwner("sweep-provider", leaseConfig) === process.ppid);
+	check("another live process holds the provider sweep", sweepLeaseOwner("sweep-provider") === process.ppid);
+	check("a held provider sweep cannot be claimed", claimSweepLease("sweep-provider") === false);
+	releaseSweepLease("sweep-provider");
+	check("releasing never steals another process's provider sweep", sweepLeaseOwner("sweep-provider") === process.ppid);
 
 	// A DEAD process's provider sweep is stale and may be taken over.
 	writeFileSync(join(leaseDir, "dead-sweep.sweep-lease"), "999999999\n", "utf8");
-	check("a dead owner's provider sweep is stale", sweepLeaseOwner("dead-sweep", leaseConfig) === undefined);
-	check("a stale provider sweep can be taken over", claimSweepLease("dead-sweep", leaseConfig) === true);
-	check("the taken-over provider sweep is ours", sweepLeaseOwner("dead-sweep", leaseConfig) === process.pid);
-	releaseSweepLease("dead-sweep", leaseConfig);
+	check("a dead owner's provider sweep is stale", sweepLeaseOwner("dead-sweep") === undefined);
+	check("a stale provider sweep can be taken over", claimSweepLease("dead-sweep") === true);
+	check("the taken-over provider sweep is ours", sweepLeaseOwner("dead-sweep") === process.pid);
+	releaseSweepLease("dead-sweep");
 
 	// Sweep claims must not leak into the API-key entry-lease API.
-	check("claiming a provider sweep succeeds independently", claimSweepLease("sweep-only", leaseConfig) === true);
+	check("claiming a provider sweep succeeds independently", claimSweepLease("sweep-only") === true);
 	check(
 		"a provider sweep is not an entry lease",
-		leasedByOthers("sweep-only", ["k0", "k1", "k2"], leaseConfig).size === 0,
+		leasedByOthers("sweep-only", ["k0", "k1", "k2"]).size === 0,
 	);
-	check("a provider sweep has no entry owner", leaseOwner("sweep-only", "k0", leaseConfig) === undefined);
+	check("a provider sweep has no entry owner", leaseOwner("sweep-only", "k0") === undefined);
 
 	// Clean shutdown releases this process's provider sweep too.
-	claimSweepLease("cleanup-sweep", leaseConfig);
-	releaseOwnLeases(leaseConfig);
-	check("own-claims cleanup removes this process's provider sweep", sweepLeaseOwner("cleanup-sweep", leaseConfig) === undefined);
+	claimSweepLease("cleanup-sweep");
+	releaseOwnLeases();
+	check("own-claims cleanup removes this process's provider sweep", sweepLeaseOwner("cleanup-sweep") === undefined);
 
 	// A sweep that is STILL RUNNING keeps its claim: releasing it early would
 	// let another session sweep the same provider in parallel.
-	claimSweepLease("running-sweep", leaseConfig);
-	releaseOwnLeases(leaseConfig, new Set(["running-sweep"]));
-	check("cleanup keeps the claim of a running sweep", sweepLeaseOwner("running-sweep", leaseConfig) === process.pid);
-	releaseSweepLease("running-sweep", leaseConfig);
+	claimSweepLease("running-sweep");
+	releaseOwnLeases(new Set(["running-sweep"]));
+	check("cleanup keeps the claim of a running sweep", sweepLeaseOwner("running-sweep") === process.pid);
+	releaseSweepLease("running-sweep");
 } finally {
+	if (process.env.PI_CODING_AGENT_DIR === leaseHome) delete process.env.PI_CODING_AGENT_DIR;
 	rmSync(leaseHome, { recursive: true, force: true });
 }
 
@@ -1442,6 +1451,55 @@ check(
 	"startup sweep is disabled for an arbitrary other flag value",
 	!startupSweepEnabled({ PI_KEYROUTER_SWEEP: "enabled" }),
 );
+
+// ---------------------------------------------------------------------------
+// 13. Config location migration
+//
+// The config used to live at ~/.pi/keyrouter.json and now lives in pi's agent
+// dir. An updated install must keep its pools without a hand edit: the first
+// start moves the file and says so. PI_KEYROUTER_CONFIG opts out entirely.
+// ---------------------------------------------------------------------------
+{
+	const migrateHome = mkdtempSync(join(tmpdir(), "kr-unit-migrate-home-"));
+	const migrateAgent = mkdtempSync(join(tmpdir(), "kr-unit-migrate-agent-"));
+	const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const prevConfigOverride = process.env.PI_KEYROUTER_CONFIG;
+	try {
+		delete process.env.PI_KEYROUTER_CONFIG;
+		process.env.PI_CODING_AGENT_DIR = migrateAgent;
+		const legacy = legacyConfigPath(migrateHome);
+		mkdirSync(join(migrateHome, ".pi"), { recursive: true });
+		writeFileSync(legacy, JSON.stringify({ providers: [{ name: "google", keys: [] }] }), "utf8");
+
+		check("a legacy config needs migration", needsLegacyConfigMigration(migrateHome) === true);
+		check("migration reports a move", migrateLegacyConfig(migrateHome) === true);
+		check("the legacy file is gone after the move", !existsSync(legacy));
+		check("the config sits at the new location", existsSync(join(migrateAgent, "pi-keyrouter.json")));
+		check("the moved config parses", loadConfig().providers[0]?.name === "google");
+		check("a migrated config needs no further migration", needsLegacyConfigMigration(migrateHome) === false);
+		check("a second migration is a no-op", migrateLegacyConfig(migrateHome) === false);
+
+		// An explicit override owns the location: the legacy file is left alone.
+		process.env.PI_KEYROUTER_CONFIG = join(migrateAgent, "override.json");
+		writeFileSync(legacy, "{}", "utf8");
+		check("an override opts out of migration", needsLegacyConfigMigration(migrateHome) === false);
+		check("an override migration does nothing", migrateLegacyConfig(migrateHome) === false);
+		check("the override opt-out leaves the legacy file alone", existsSync(legacy));
+		delete process.env.PI_KEYROUTER_CONFIG;
+
+		// Nothing at the legacy location: nothing to do (a fresh install).
+		rmSync(legacy, { force: true });
+		rmSync(join(migrateAgent, "pi-keyrouter.json"), { force: true });
+		check("no legacy file, nothing to migrate", needsLegacyConfigMigration(migrateHome) === false);
+	} finally {
+		if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+		if (prevConfigOverride === undefined) delete process.env.PI_KEYROUTER_CONFIG;
+		else process.env.PI_KEYROUTER_CONFIG = prevConfigOverride;
+		rmSync(migrateHome, { recursive: true, force: true });
+		rmSync(migrateAgent, { recursive: true, force: true });
+	}
+}
 
 console.log(failures === 0 ? "\nall oauth unit tests pass" : `\n${failures} unit test(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

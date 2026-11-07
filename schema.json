@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
   "title": "pi-keyrouter configuration",
-  "description": "Configuration for pi-keyrouter credential pools. This schema is intended for ~/.pi/keyrouter.json and provides IDE completion, hover documentation, and validation without changing keyrouter's runtime behavior.",
+  "description": "Configuration for pi-keyrouter credential pools. This schema is intended for ~/.pi/agent/pi-keyrouter.json and provides IDE completion, hover documentation, and validation without changing keyrouter's runtime behavior.",
   "type": "object",
   "properties": {
     "$schema": {
       "type": "string",
       "const": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
       "default": "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json",
-      "description": "Optional JSON Schema reference. Put this property first in ~/.pi/keyrouter.json to enable schema-aware completion and validation in editors that support JSON Schema. keyrouter does not add or migrate this property for existing configurations.",
+      "description": "Optional JSON Schema reference. Put this property first in ~/.pi/agent/pi-keyrouter.json to enable schema-aware completion and validation in editors that support JSON Schema. keyrouter does not add or migrate this property for existing configurations.",
       "examples": [
         "https://raw.githubusercontent.com/jeryjs/pi-keyrouter/refs/heads/main/schema.json"
       ]

@@ -554,7 +554,7 @@ const cases = [
 		// Another live process holds the FIRST entry of the pool: this run must
 		// start on the next one instead of piling onto the same credential.
 		before: () => {
-			const leaseDir = join(PI_HOME, "keyrouter-leases");
+			const leaseDir = join(AGENT_DIR, "extensions", ".pi-keyrouter-leases");
 			mkdirSync(leaseDir, { recursive: true });
 			writeFileSync(join(leaseDir, "krtest.A.lease"), `${process.ppid}\n`, "utf8");
 		},
@@ -762,10 +762,10 @@ function lastRotateAfterLastContinue(trace) {
 async function prepareFixture() {
 	mkdirSync(AGENT_DIR, { recursive: true });
 	mkdirSync(PI_HOME, { recursive: true });
-	// The credential leases live next to the config file, so they land here.
-	// Start from an empty directory: a claim left by a previous run belongs to
-	// a process that no longer exists and would only be stale noise.
-	rmSync(join(PI_HOME, "keyrouter-leases"), { recursive: true, force: true });
+	// The credential leases live in the agent dir's extensions folder, so they
+	// land here. Start from an empty directory: a claim left by a previous run
+	// belongs to a process that no longer exists and would only be stale noise.
+	rmSync(join(AGENT_DIR, "extensions", ".pi-keyrouter-leases"), { recursive: true, force: true });
 	const modelsPath = join(AGENT_DIR, "models.json");
 	const fixture = {
 		providers: {
@@ -842,10 +842,10 @@ async function main() {
 	const results = [];
 	for (const c of selected) {
 		writeConfig(c.config);
-		// The credential leases live next to the config file, so they land in the
-		// fixture. Every case starts without any: a claim left by the previous
-		// run belongs to a process that no longer exists.
-		rmSync(join(PI_HOME, "keyrouter-leases"), { recursive: true, force: true });
+		// The credential leases live in the agent dir's extensions folder, so they
+		// land in the fixture. Every case starts without any: a claim left by the
+		// previous run belongs to a process that no longer exists.
+		rmSync(join(AGENT_DIR, "extensions", ".pi-keyrouter-leases"), { recursive: true, force: true });
 		if (c.before) await c.before();
 		if (existsSync(TRACE)) rmSync(TRACE);
 		await admin("/__admin/reset");

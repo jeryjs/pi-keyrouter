@@ -43,10 +43,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { configPath } from "./config.ts";
+import { leaseDir } from "./config.ts";
 
-/** Directory (under the agent dir) that holds the lease files. */
-const LEASE_DIR_NAME = "keyrouter-leases";
 
 /**
  * How long a claim may live before it is treated as abandoned.
@@ -69,19 +67,6 @@ const LEASE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
  */
 const SWEEP_LEASE_TTL_MS = 5 * 60 * 1000;
 
-/**
- * The directory that holds the lease files.
- *
- * It sits NEXT TO the config file, in a directory of its own: the leases
- * describe the same pool as `keyrouter.json`, so they share its scope (and
- * its `PI_KEYROUTER_CONFIG` override), and they never touch the config file
- * the user hand-edits. A sibling directory rather than a subdirectory of
- * `~/.pi` keeps the two artifacts apart.
- */
-export function leaseDir(configFile?: string): string {
-	const file = configFile ?? configPath();
-	return path.join(path.dirname(path.resolve(file)), LEASE_DIR_NAME);
-}
 
 /**
  * A file-name-safe form of a provider id.
@@ -97,13 +82,13 @@ function safeName(value: string): string {
 }
 
 /** The file that holds the claim for one pool entry. */
-function leaseFile(providerId: string, entryName: string, configFile?: string): string {
-	return path.join(leaseDir(configFile), `${safeName(providerId)}.${safeName(entryName)}.lease`);
+function leaseFile(providerId: string, entryName: string): string {
+	return path.join(leaseDir(), `${safeName(providerId)}.${safeName(entryName)}.lease`);
 }
 
 /** The file that holds the provider-wide sweep claim. */
-function sweepLeaseFile(providerId: string, configFile?: string): string {
-	return path.join(leaseDir(configFile), `${safeName(providerId)}.sweep-lease`);
+function sweepLeaseFile(providerId: string): string {
+	return path.join(leaseDir(), `${safeName(providerId)}.sweep-lease`);
 }
 
 /** The pid recorded in a claim file, or undefined when it cannot be read. */
@@ -153,8 +138,8 @@ function isStale(file: string, owner: number | undefined, ttlMs = LEASE_TTL_MS):
  * process owns the entry; the caller may still use it (a lease must never
  * block a request), but it should prefer a different one.
  */
-export function claimLease(providerId: string, entryName: string, configFile?: string): boolean {
-	const file = leaseFile(providerId, entryName, configFile);
+export function claimLease(providerId: string, entryName: string): boolean {
+	const file = leaseFile(providerId, entryName);
 	const payload = `${process.pid}\n`;
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -199,8 +184,8 @@ export function claimLease(providerId: string, entryName: string, configFile?: s
  * A claim owned by another process is never removed: releasing must not steal
  * somebody else's entry.
  */
-export function releaseLease(providerId: string, entryName: string, configFile?: string): void {
-	const file = leaseFile(providerId, entryName, configFile);
+export function releaseLease(providerId: string, entryName: string): void {
+	const file = leaseFile(providerId, entryName);
 	const owner = readOwner(file);
 	if (owner !== undefined && owner !== process.pid) return;
 	try {
@@ -218,8 +203,8 @@ export function releaseLease(providerId: string, entryName: string, configFile?:
  * process owns the provider sweep. Claiming an existing claim of ours renews
  * its timestamp, so a long sweep can keep it fresh.
  */
-export function claimSweepLease(providerId: string, configFile?: string): boolean {
-	const file = sweepLeaseFile(providerId, configFile);
+export function claimSweepLease(providerId: string): boolean {
+	const file = sweepLeaseFile(providerId);
 	const payload = `${process.pid}\n`;
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -266,8 +251,8 @@ export function claimSweepLease(providerId: string, configFile?: string): boolea
  * A claim owned by another process is never removed: releasing must not let a
  * second session start sweeping the same provider.
  */
-export function releaseSweepLease(providerId: string, configFile?: string): void {
-	const file = sweepLeaseFile(providerId, configFile);
+export function releaseSweepLease(providerId: string): void {
+	const file = sweepLeaseFile(providerId);
 	const owner = readOwner(file);
 	if (owner !== undefined && owner !== process.pid) return;
 	try {
@@ -282,8 +267,8 @@ export function releaseSweepLease(providerId: string, configFile?: string): void
  *
  * `undefined` means the provider is free (or the claim is stale).
  */
-export function sweepLeaseOwner(providerId: string, configFile?: string): number | undefined {
-	const file = sweepLeaseFile(providerId, configFile);
+export function sweepLeaseOwner(providerId: string): number | undefined {
+	const file = sweepLeaseFile(providerId);
 	const owner = readOwner(file);
 	if (owner === undefined) return undefined;
 	if (isStale(file, owner, SWEEP_LEASE_TTL_MS)) return undefined;
@@ -298,21 +283,21 @@ export function sweepLeaseOwner(providerId: string, configFile?: string): number
  * finishes, and releasing it early would let another session start sweeping
  * the same provider while this one is still exchanging refresh tokens.
  */
-export function releaseOwnLeases(configFile?: string, keepSweepProviders?: ReadonlySet<string>): void {
+export function releaseOwnLeases(keepSweepProviders?: ReadonlySet<string>): void {
 	let names: string[];
 	try {
-		names = fs.readdirSync(leaseDir(configFile));
+		names = fs.readdirSync(leaseDir());
 	} catch {
 		return;
 	}
 	const keep = new Set<string>();
 	for (const providerId of keepSweepProviders ?? []) {
-		keep.add(path.basename(sweepLeaseFile(providerId, configFile)));
+		keep.add(path.basename(sweepLeaseFile(providerId)));
 	}
 	for (const name of names) {
 		if (!name.endsWith(".lease") && !name.endsWith(".sweep-lease")) continue;
 		if (name.endsWith(".sweep-lease") && keep.has(name)) continue; // the sweep is still running
-		const file = path.join(leaseDir(configFile), name);
+		const file = path.join(leaseDir(), name);
 		if (readOwner(file) === process.pid) {
 			try {
 				fs.rmSync(file, { force: true });
@@ -331,17 +316,16 @@ export function releaseOwnLeases(configFile?: string, keepSweepProviders?: Reado
  * one it is coming from, not a conflict.
  */
 export function leasedByOthers(
-	providerId: string,
-	entryNames: readonly string[],
-	configFile?: string,
+		providerId: string,
+		entryNames: readonly string[],
 ): Set<number> {
 	const leased = new Set<number>();
-	const dir = leaseDir(configFile);
+	const dir = leaseDir();
 	// The claim file of every entry of this pool, mapped to its position. The
 	// claim is named after the ENTRY, so a pool edit cannot detach it.
 	const wanted = new Map<string, number>();
 	entryNames.forEach((entryName, index) => {
-		wanted.set(path.basename(leaseFile(providerId, entryName, configFile)), index);
+		wanted.set(path.basename(leaseFile(providerId, entryName)), index);
 	});
 	let files: string[];
 	try {
@@ -387,12 +371,8 @@ export function leasedByOthers(
  *
  * `undefined` means the entry is free (or the claim is stale).
  */
-export function leaseOwner(
-	providerId: string,
-	entryName: string,
-	configFile?: string,
-): number | undefined {
-	const file = leaseFile(providerId, entryName, configFile);
+export function leaseOwner(providerId: string, entryName: string): number | undefined {
+	const file = leaseFile(providerId, entryName);
 	const owner = readOwner(file);
 	if (owner === undefined) return undefined;
 	if (isStale(file, owner)) return undefined;

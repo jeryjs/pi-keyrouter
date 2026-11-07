@@ -6,9 +6,11 @@
 // credentials are personal credentials that do not belong inside a project
 // directory (risk of leaking via git, shared repos, etc.).
 //
-// Single location: ~/.pi/keyrouter.json
-//   - Windows: %USERPROFILE%\.pi\keyrouter.json
-//   - macOS/Linux: ~/.pi/keyrouter.json
+// Single location: pi's agent dir (getAgentDir(), so PI_CODING_AGENT_DIR is
+//   honoured) — Windows: %USERPROFILE%\.pi\agent\pi-keyrouter.json,
+//   macOS/Linux: ~/.pi/agent/pi-keyrouter.json
+// A config still at the pre-migration location ~/.pi/keyrouter.json is moved
+// there on the first start (see migrateLegacyConfig below).
 //
 // The optional `$schema` reference below enables IDE completion and validation.
 // Existing configuration files do not need it and are never migrated.
@@ -78,6 +80,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
 	AccountEntry,
 	ApiKey,
@@ -258,9 +261,9 @@ function sleepSync(ms: number): void {
 	}
 }
 
-/** The lock file that guards writes to the config at `file`. */
-function writeLockFile(file: string): string {
-	return path.join(path.dirname(path.resolve(file)), "keyrouter-leases", "config.lock");
+/** The lock file that guards config writes. It lives in the lease directory. */
+function writeLockFile(): string {
+	return path.join(leaseDir(), "config.lock");
 }
 
 /**
@@ -324,8 +327,8 @@ function releaseWriteLock(lock: string): void {
  * Re-entrant within this process, so a write-back may call another write-back
  * without deadlocking on its own lock file.
  */
-function withConfigWriteLock<T>(file: string, fn: () => T): T {
-	const lock = writeLockFile(file);
+function withConfigWriteLock<T>(_file: string, fn: () => T): T {
+	const lock = writeLockFile();
 	const depth = writeLockDepth.get(lock) ?? 0;
 	if (depth === 0 && !acquireWriteLock(lock)) return fn();
 	writeLockDepth.set(lock, depth + 1);
@@ -862,18 +865,86 @@ export function defaultConfig(): KeyRouterConfig {
 }
 
 /**
- * Resolve the config path. Default is `~/.pi/keyrouter.json` — always under
- * the user profile, never project-scoped (keys are global credentials).
- * `PI_KEYROUTER_CONFIG` overrides it, which is what the test suite uses.
+ * Resolve the config path. Default is pi's agent dir (`getAgentDir()`, so
+ * `PI_CODING_AGENT_DIR` is honoured) — user-level, never project-scoped (keys
+ * are global credentials). `PI_KEYROUTER_CONFIG` overrides it, which is what
+ * the test suite uses.
  *
  * @param _cwd ignored — config is always user-level
- * @param home override home dir (for testing)
+ * @param _home ignored — the path follows pi's agent dir; override it with
+ *   `PI_KEYROUTER_CONFIG` instead
  */
-export function configPath(_cwd?: string, home?: string): string {
+export function configPath(_cwd?: string, _home?: string): string {
 	const override = process.env["PI_KEYROUTER_CONFIG"] || undefined;
 	if (override) return override;
-	const homeDir = home ?? os.homedir();
-	return path.join(homeDir, ".pi", "keyrouter.json");
+	return path.join(getAgentDir(), "pi-keyrouter.json");
+}
+
+/** Directory (inside pi's extensions dir) that holds the lease files. */
+const LEASE_DIR_NAME = ".pi-keyrouter-leases";
+
+/**
+ * The directory that holds the lease files (entry claims, provider sweep
+ * claims, and the config write lock).
+ *
+ * It lives inside pi's extensions directory under a dot-prefixed name: hidden
+ * by default, and ignored by pi's extension discovery (it holds no entry
+ * points), so the agent dir root stays pi's own. The leases describe the same
+ * pool as the config, so they follow the same agent dir — `PI_CODING_AGENT_DIR`
+ * moves both, while `PI_KEYROUTER_CONFIG` moves only the config file.
+ */
+export function leaseDir(): string {
+	return path.join(getAgentDir(), "extensions", LEASE_DIR_NAME);
+}
+
+/** The config location before the move into pi's agent dir. */
+export function legacyConfigPath(home?: string): string {
+	return path.join(home ?? os.homedir(), ".pi", "keyrouter.json");
+}
+
+/**
+ * True when a config still sits at the legacy location and the current one has
+ * no file yet — i.e. `migrateLegacyConfig` has something to move.
+ *
+ * `PI_KEYROUTER_CONFIG` opts out entirely: an explicit override means "use
+ * exactly this file", so the legacy file is never touched. This is also what
+ * keeps the test suite hermetic.
+ *
+ * @param home override home dir (for testing)
+ */
+export function needsLegacyConfigMigration(home?: string): boolean {
+	if (process.env["PI_KEYROUTER_CONFIG"]) return false;
+	if (fs.existsSync(configPath())) return false;
+	return fs.existsSync(legacyConfigPath(home));
+}
+
+/**
+ * Move the config from the legacy location to the current one, so an updated
+ * install keeps its pools without a hand edit. A rename keeps every file
+ * property; paths on different filesystems (a `PI_CODING_AGENT_DIR` on another
+ * mount) cannot rename, so that falls back to a copy and leaves the original
+ * in place. Returns true when the config sits at the new location afterwards.
+ *
+ * @param home override home dir (for testing)
+ */
+export function migrateLegacyConfig(home?: string): boolean {
+	if (!needsLegacyConfigMigration(home)) return false;
+	const from = legacyConfigPath(home);
+	const to = configPath();
+	try {
+		fs.mkdirSync(path.dirname(to), { recursive: true });
+		try {
+			fs.renameSync(from, to);
+		} catch {
+			// Cross-device rename failed: copy instead. The copy cannot inherit the
+			// original's mode, so tighten it the way keyrouter's own writes do.
+			fs.copyFileSync(from, to);
+			fs.chmodSync(to, 0o600);
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**

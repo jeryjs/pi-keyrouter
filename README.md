@@ -15,7 +15,7 @@ this extension only chooses which credential pi resolves.
 
 ```bash
 pi install npm:@jeryjs/pi-keyrouter
-# create ~/.pi/keyrouter.json with your keys or accounts
+# create ~/.pi/agent/pi-keyrouter.json with your keys or accounts
 /reload
 ```
 
@@ -25,7 +25,7 @@ Want to stay on top of the latest changes? `pi install git:github.com/jeryjs/pi-
 
 ## What it does
 
-`~/.pi/keyrouter.json` declares a **pool** per provider id. There are two kinds:
+`~/.pi/agent/pi-keyrouter.json` declares a **pool** per provider id. There are two kinds:
 
 - **`keys`** — several API keys. keyrouter puts the active key into pi's *runtime credential
   overlay*, the same mechanism `pi --api-key` uses. The overlay wins over `auth.json` and
@@ -62,8 +62,9 @@ user prompt
 
 ## Configuration
 
-**`~/.pi/keyrouter.json` only** — user-level, never project-scoped, because API keys are personal
-credentials that must not be overridable by a repo you clone.
+**`~/.pi/agent/pi-keyrouter.json` only** — user-level, never project-scoped, because API keys are personal
+credentials that must not be overridable by a repo you clone. A config still at the old `~/.pi/keyrouter.json`
+location is moved here on the first start.
 
 ```json5
 {
@@ -201,7 +202,7 @@ A pool is shared by every pi process on the machine: a subagent, a second window
 another directory. Left alone they all install the same first entry and then hit the same 429 at
 the same time. A **lease** is the coordination: an exclusive claim on one entry of a pool.
 
-The claim is a file under `~/.pi/keyrouter-leases/`, created with an exclusive create, so the
+The claim is a file under `~/.pi/agent/extensions/.pi-keyrouter-leases/`, created with an exclusive create, so the
 filesystem — not a lock protocol — decides the winner. The claim is taken on the **entry**, not on
 its position in the pool, so removing or reordering entries cannot detach it from the credential it
 was taken for. The first process to install an entry holds the claim; another process sees it and
@@ -438,7 +439,7 @@ error, rather than leaving you logged out.
 
 ```
 /keyrouter status [provider]    live pool state per provider (kind, active entry, install state, expiry)
-/keyrouter reload     re-read ~/.pi/keyrouter.json
+/keyrouter reload     re-read ~/.pi/agent/pi-keyrouter.json
 /keyrouter reset      hand providers back to pi's own credentials immediately
 /keyrouter account <provider> [name|index]    pin a specific key or account
 /keyrouter strategy <provider> [strategy]    show or set a pool's rotation strategy
@@ -492,7 +493,7 @@ it lists every pool; naming only the pool reports it; naming a pool and a value 
 ```
 
 The change never rotates immediately — strategies act only at turn boundaries — and it is saved to
-`~/.pi/keyrouter.json`, so it survives a reload and a restart. Setting `failover` removes the field
+`~/.pi/agent/pi-keyrouter.json`, so it survives a reload and a restart. Setting `failover` removes the field
 from the file (absent already means failover). On a `keys` pool, `stalest-first` is not even
 offered: it orders by token expiry, which keys do not have, so it degrades to `round-robin` with a
 warning — the command stores the effective value so a later reload does not warn again. A strategy
@@ -513,7 +514,7 @@ other than `failover` also shows up in `/keyrouter status` next to the pool's `s
                                          removed backup from tokenharbor.
 ```
 
-`add` asks for an API key in a prompt and writes it to `~/.pi/keyrouter.json` — keyrouter never
+`add` asks for an API key in a prompt and writes it to `~/.pi/agent/pi-keyrouter.json` — keyrouter never
 runs a login of its own. (pi's prompt is a plain text field, not a masked one, so the key is
 visible while you type it.) For an `accounts` pool it captures the credential **pi** is holding right
 now, so the flow stays pi's own: `/login` first, then `/keyrouter add <provider>`. If pi is already
@@ -576,7 +577,7 @@ that reaches you — `"all"` (default), `"quiet"`, or `"silent"`:
 Pool exhaustion is never silenced: hiding the one event where the request dies would only make the
 provider's own error look unexplained. `/keyrouter status` names the active level whenever it is not
 the default, and `/keyrouter notifications` shows it on its own: `/keyrouter notifications quiet`
-sets the level, writes it to `~/.pi/keyrouter.json` and applies it to the running session right
+sets the level, writes it to `~/.pi/agent/pi-keyrouter.json` and applies it to the running session right
 away — no hand-editing of the file, and no `/reload` needed. In headless/print mode there is
 no UI, so set `PI_KEYROUTER_TRACE=<file>` to log decisions (credential **names** only, never values) —
 the trace records every decision regardless of the level:
