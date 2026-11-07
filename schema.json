@@ -147,6 +147,37 @@
           "default": true,
           "description": "For an accounts pool, rotate when an account-level quota or billing error is reported. Defaults to true because separate OAuth accounts are separate subscriptions. Only applies to accounts pools."
         },
+        "rotationTriggers": {
+          "type": "object",
+          "description": "Extra provider-specific error patterns that make this pool rotate. Patterns are JavaScript regular expressions matched case-insensitively against the assistant error message. A custom trigger is explicit opt-in, so it also applies to keys pools.",
+          "properties": {
+            "rate-limited": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "format": "regex"
+              }
+            },
+            "unauthorized": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "format": "regex"
+              }
+            },
+            "quota": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "format": "regex"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
         "strategy": {
           "$ref": "#/$defs/rotationStrategy"
         },

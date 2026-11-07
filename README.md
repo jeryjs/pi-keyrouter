@@ -125,6 +125,7 @@ The classification is deliberate, because pi only *retries* some failures.
 | `529` / "overloaded" | assistant error message | provider-wide cooldown, **no rotation** | same |
 | `500` / `502` / `503` | assistant error message | **ignored** — pi retries the same key | same |
 | any 2xx | `after_provider_response` | entry marked ok, its cooldown cleared |
+| provider-specific `rotationTriggers` | assistant error message | cooldown, **rotate** | cooldown, **rotate** |
 
 The differing quota row is the point: an API key for an account that has hit its limit cannot help,
 whereas a different OAuth account is a different subscription — so the same error wording
@@ -140,6 +141,32 @@ Two consequences of pi's retry policy worth knowing:
   leg needs no continuation.)
 - **Failed requests are not visible to `after_provider_response`.** The OpenAI SDK throws on non-2xx,
   so pi's response hook never fires. That is why errors are read from `message_end`.
+
+### Provider-specific triggers
+
+Use `rotationTriggers` on a provider to extend keyrouter's built-in failure rules. Each key is an
+existing rotation reason (`rate-limited`, `unauthorized`, or `quota`) mapped to an array of regular
+expressions. Patterns are matched case-insensitively against the full assistant error message.
+
+```jsonc
+{
+  "providers": [{
+    "name": "my-provider",
+    "keys": [
+      { "name": "primary", "value": "$MY_PROVIDER_KEY" },
+      { "name": "backup",  "value": "$MY_PROVIDER_KEY_BACKUP" }
+    ],
+    "rotationTriggers": {
+      "quota": ["insufficient_credits", "Insufficient balance"]
+    }
+  }]
+}
+```
+
+A custom trigger is explicit opt-in, so it rotates a `keys` pool even when the built-in quota
+rules would ignore the error. Use that only when another key in the pool can succeed after the
+first one fails. An invalid regular expression is ignored with a warning; the rest of the pool keeps
+working.
 
 ### Strategies
 

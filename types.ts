@@ -39,6 +39,11 @@ export type PoolKind = "keys" | "oauth";
 
 /** How the next entry is chosen at a turn boundary. See `ProviderConfig.strategy`. */
 export type RotationStrategy = "failover" | "round-robin" | "stalest-first" | "random";
+/** Rotation reasons that can be extended with provider-specific error patterns. */
+export type RotationTriggerReason = "rate-limited" | "unauthorized" | "quota";
+
+/** Provider-specific, case-insensitive regular expressions grouped by rotation reason. */
+export type RotationTriggers = Partial<Record<RotationTriggerReason, string[]>>;
 
 /** Configuration for a single provider. */
 export interface ProviderConfig {
@@ -65,6 +70,12 @@ export interface ProviderConfig {
 	 * limit that switching keys cannot lift.
 	 */
 	rotateOnQuota?: boolean;
+	/**
+	 * Extra error patterns that make this provider rotate. Patterns are regular
+	 * expressions matched case-insensitively against the assistant error message.
+	 * A custom trigger is explicit opt-in, so it also applies to a `keys` pool.
+	 */
+	rotationTriggers?: RotationTriggers;
 	/**
 	 * How the next entry is picked at each turn boundary. Default "failover".
 	 *

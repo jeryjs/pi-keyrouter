@@ -28,6 +28,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the first property to enable it. The reference is optional: existing configurations are intentionally
   left untouched, with no migration, rewrite, or notification.
 
+- **Provider-specific rotation triggers.** A provider can now extend keyrouter's built-in failure rules with
+  a `rotationTriggers` map of case-insensitive regular expressions grouped by rotation reason. Custom
+  triggers are explicit opt-in, so they can make an API-key pool rotate on provider-specific errors such as
+  `insufficient_credits` without changing the built-in rules for every other provider.
+
 ### Changed
 
 - **The config moved into pi's agent directory.** The pool file now lives at `~/.pi/agent/pi-keyrouter.json`

@@ -89,6 +89,8 @@ import type {
 	OAuthCredential,
 	PoolKind,
 	ProviderConfig as ProviderPool,
+	RotationTriggerReason,
+	RotationTriggers,
 	RotationStrategy,
 } from "./types.ts";
 import { validateIdentityPath } from "./identity.ts";
@@ -1004,6 +1006,63 @@ export function normalizeStrategy(
 	return "failover";
 }
 
+/** Reasons that a provider may extend with custom error patterns. */
+const ROTATION_TRIGGER_REASONS: ReadonlySet<string> = new Set([
+	"rate-limited",
+	"unauthorized",
+	"quota",
+]);
+
+/**
+ * Validate provider-specific rotation patterns. A malformed pattern is ignored
+ * with a warning rather than taking down the whole pool.
+ */
+export function normalizeRotationTriggers(
+	raw: unknown,
+	poolName: string,
+	warnings: string[],
+): RotationTriggers | undefined {
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		warnings.push(`"${poolName}": "rotationTriggers" must be an object — ignored.`);
+		return undefined;
+	}
+
+	const triggers: RotationTriggers = {};
+	for (const [reason, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!ROTATION_TRIGGER_REASONS.has(reason)) {
+			warnings.push(
+				`"${poolName}": "rotationTriggers.${reason}" is not a valid rotation reason — ignored.`,
+			);
+			continue;
+		}
+		if (!Array.isArray(value)) {
+			warnings.push(`"${poolName}": "rotationTriggers.${reason}" must be an array — ignored.`);
+			continue;
+		}
+
+		const patterns: string[] = [];
+		for (const pattern of value) {
+			if (typeof pattern !== "string" || pattern.trim().length === 0) {
+				warnings.push(
+					`"${poolName}": "rotationTriggers.${reason}" contains a non-string or empty pattern — ignored.`,
+				);
+				continue;
+			}
+			try {
+				new RegExp(pattern, "i");
+				patterns.push(pattern);
+			} catch {
+				warnings.push(
+					`"${poolName}": "rotationTriggers.${reason}" contains an invalid regular expression — ignored.`,
+				);
+			}
+		}
+		if (patterns.length > 0) triggers[reason as RotationTriggerReason] = patterns;
+	}
+	return Object.keys(triggers).length > 0 ? triggers : undefined;
+}
+
 function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 	const warnings: string[] = [];
 	const providers: ProviderPool[] = [];
@@ -1024,6 +1083,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 		seenNames.add(nameKey);
 		const hasKeys = Array.isArray(raw.keys);
 		const hasAccounts = Array.isArray(raw.accounts);
+		const rotationTriggers = normalizeRotationTriggers(raw.rotationTriggers, raw.name, warnings);
 
 		if (hasKeys && hasAccounts) {
 			warnings.push(
@@ -1068,6 +1128,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				keys,
 				kind: "keys" satisfies PoolKind,
 				takeoverOAuth: raw.takeoverOAuth === true,
+				rotationTriggers,
 				strategy: normalizeStrategy(raw.strategy, "keys" satisfies PoolKind, raw.name, warnings),
 				sweepRefresh: false,
 				active: typeof raw.active === "string" ? raw.active : undefined,
@@ -1115,6 +1176,7 @@ function normalize(input: Partial<KeyRouterConfig>): KeyRouterConfig {
 				// Each OAuth account is a separate subscription, so an account-level
 				// limit is exactly when the next account is wanted. Default true.
 			rotateOnQuota: raw.rotateOnQuota !== false,
+				rotationTriggers,
 			strategy: normalizeStrategy(raw.strategy, "oauth" satisfies PoolKind, raw.name, warnings),
 			// The idle-account sweep is opt-in per pool. Off unless the config
 			// says so: see TODO.md for what still has to be fixed before it can be

@@ -191,6 +191,18 @@ const ACCOUNTS = (accounts, extra = {}) => ({
 
 const CONFIGS = {
 	abc: POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]),
+	// A provider-specific trigger makes an otherwise non-rotatable API-key error
+	// rotate this pool.
+	"abc-custom-trigger": {
+		...POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]),
+		providers: [
+			{
+				name: "krtest",
+				keys: [{ name: "A", value: "sk-a" }, { name: "B", value: "sk-b" }, { name: "C", value: "sk-c" }],
+				rotationTriggers: { quota: ["insufficient_credits"] },
+			},
+		],
+	},
 	// Same pool with the status lines turned down: the setting must gate only
 	// ui.notify, never the rotation machinery itself.
 	"abc-quiet": { ...POOL(["A", "sk-a"], ["B", "sk-b"], ["C", "sk-c"]), notifications: "quiet" },
@@ -632,6 +644,30 @@ const cases = [
 			["trace: ignored as non-rotatable", traceHas(trace, "ignore krtest")],
 			["zero rotations", traceCount(trace, "rotate") === 0],
 			["zero overloads", traceCount(trace, "overload") === 0],
+		],
+	},
+	{
+		name: "custom-provider-trigger-rotates-api-key",
+		config: "abc-custom-trigger",
+		plan: {
+			byKey: {
+				"sk-a": {
+					status: 402,
+					type: "insufficient_credits",
+					code: "insufficient_credits",
+					message: "Insufficient balance. Your Credits balance is $-0.00",
+				},
+			},
+			default: "ok",
+			text: "PONG",
+		},
+		expect: ({ keys, trace, pi }) => [
+			["pi recovered and printed PONG", /PONG/.test(pi.stdout)],
+			["first request used sk-a", keys[0] === "sk-a"],
+			["a later request used sk-b", keys.includes("sk-b")],
+			["trace: rotate A -> B", traceHas(trace, "rotate krtest A -> B")],
+			["trace: 402 quota", traceHas(trace, "402 quota")],
+			["continuation requested (402 is non-retryable)", traceHas(trace, "continue krtest")],
 		],
 	},
 	{

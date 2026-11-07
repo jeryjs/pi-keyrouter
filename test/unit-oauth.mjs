@@ -91,6 +91,10 @@ check(
 				CONFIG_SCHEMA.$defs?.oauthCredential,
 		),
 );
+check(
+	"the JSON Schema covers provider-specific rotation triggers",
+	CONFIG_SCHEMA.$defs?.provider?.properties?.rotationTriggers?.properties?.quota?.type === "array",
+);
 
 // ---------------------------------------------------------------------------
 // 1. credentialStore capability guard
@@ -325,6 +329,53 @@ try {
 		"utf8",
 	);
 	check("rotateOnQuota: false is honoured", loadConfig().providers[0]?.rotateOnQuota === false);
+
+	// Provider-specific rotation triggers are read back and malformed entries are
+	// ignored without taking down the pool.
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({
+			providers: [
+				{
+					name: "custom",
+					keys: [{ name: "a", value: "sk-1" }],
+					rotationTriggers: {
+						quota: ["insufficient_credits"],
+						unauthorized: ["bad_token"],
+					},
+				},
+			],
+		}),
+		"utf8",
+	);
+	const customTriggers = loadConfig();
+	check(
+		"provider-specific rotation triggers are read back",
+		JSON.stringify(customTriggers.providers[0]?.rotationTriggers) ===
+			JSON.stringify({ quota: ["insufficient_credits"], unauthorized: ["bad_token"] }),
+		JSON.stringify(customTriggers.providers[0]?.rotationTriggers),
+	);
+	writeFileSync(
+		cfgFile,
+		JSON.stringify({
+			providers: [
+				{
+					name: "custom",
+					keys: [{ name: "a", value: "sk-1" }],
+					rotationTriggers: { quota: ["["], unknown: ["x"] },
+				},
+			],
+		}),
+		"utf8",
+	);
+	const badTriggers = loadConfig();
+	check("malformed rotation triggers are ignored", badTriggers.providers[0]?.rotationTriggers === undefined);
+	check(
+		"malformed rotation triggers produce warnings",
+		(badTriggers.warnings ?? []).some((w) => /invalid regular expression/.test(w)) &&
+			(badTriggers.warnings ?? []).some((w) => /valid rotation reason/.test(w)),
+		JSON.stringify(badTriggers.warnings),
+	);
 
 	// sweepRefresh: the idle-account sweep is opt-in per pool, and off by
 	// default.

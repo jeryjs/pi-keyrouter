@@ -102,6 +102,7 @@ import type {
 	ProviderConfig as ProviderPoolConfig,
 	RotationEvent,
 	RotationReason,
+	RotationTriggerReason,
 	RotationStrategy,
 } from "./types.ts";
 /**
@@ -207,6 +208,11 @@ function runtimeCredentials(
 	return candidate as RuntimeCredentialApi;
 }
 
+interface CompiledRotationTrigger {
+	reason: RotationTriggerReason;
+	pattern: RegExp;
+}
+
 interface ProviderRuntime {
 	/** Provider id as pi knows it (the credential-overlay key). */
 	providerId: string;
@@ -224,6 +230,8 @@ interface ProviderRuntime {
 	 * keys pools, where a quota error is account-wide and switching cannot lift it.
 	 */
 	rotateOnQuota: boolean;
+	/** Provider-specific error patterns that make this pool rotate. */
+	rotationTriggers: CompiledRotationTrigger[];
 	/** How the next entry is picked at each turn boundary (per-pool setting). */
 	/**
 	 * Whether this pool's idle accounts may be refreshed at session start.
@@ -357,6 +365,12 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 			kind: providerCfg.kind,
 			// Only meaningful for OAuth pools; false for keys pools by construction.
 			rotateOnQuota: providerCfg.kind === "oauth" && providerCfg.rotateOnQuota !== false,
+			rotationTriggers: Object.entries(providerCfg.rotationTriggers ?? {}).flatMap(([reason, patterns]) =>
+				(patterns ?? []).map((pattern) => ({
+					reason: reason as RotationTriggerReason,
+					pattern: new RegExp(pattern, "i"),
+				})),
+			),
 			sweepRefresh: providerCfg.kind === "oauth" && providerCfg.sweepRefresh === true,
 			strategy: providerCfg.strategy ?? "failover",
 			keys:
@@ -1619,6 +1633,7 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		// dead-refresh-token error as a plain unauthorized one, hitting the same
 		// pool entry but reporting the wrong cause. A refresh failure is strictly
 		// more specific, so it wins.
+		const customTrigger = rt.rotationTriggers.find((trigger) => trigger.pattern.test(errMsg));
 		let reason: RotationReason | null = null;
 		let status = 0;
 		if (rt.kind === "oauth" && REFRESH_FAILED_RE.test(errMsg)) {
@@ -1630,6 +1645,16 @@ export default function keyRouterExtension(pi: ExtensionAPI): void {
 		} else if (UNAUTHORIZED_RE.test(errMsg)) {
 			reason = "unauthorized";
 			status = errMsg.includes("401") ? 401 : 403;
+		} else if (customTrigger) {
+			reason = customTrigger.reason;
+			status =
+				customTrigger.reason === "rate-limited"
+					? 429
+					: customTrigger.reason === "unauthorized"
+						? errMsg.includes("401")
+							? 401
+							: 403
+						: 402;
 		} else if (rt.kind === "oauth" && rt.rotateOnQuota && QUOTA_RE.test(errMsg)) {
 			reason = "quota";
 			status = 402;
