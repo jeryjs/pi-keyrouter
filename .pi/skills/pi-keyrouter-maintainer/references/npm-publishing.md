@@ -170,3 +170,22 @@ The maintainer prefers patch bumps over minor ones — `1.3.1` and `1.3.2` and
 `1.3.3` rather than `1.4.0` — and does not want released version numbers
 rewritten. A change is patch-worthy if it fixes behaviour, tightens tooling, or
 documents; reserve minor for a new user-facing capability.
+
+## GPG signing in headless terminals
+
+When the terminal lacks a real TTY (e.g. Paseo's agent terminal, GitHub Actions,
+Docker, some WSL setups), `pinentry` fails with `Inappropriate ioctl for device`.
+The GPG agent's **loopback mode** bypasses pinentry entirely if the passphrase
+is already cached:
+
+```bash
+git -c gpg.program=gpg tag -s v1.9.0 -m "v1.9.0 — ..."
+```
+
+This works because `-c gpg.program=gpg` invokes `gpg` directly with the default
+options, and the agent serves the passphrase from its cache (via loopback).
+No `PINENTRY_PROGRAM` or `GPG_TTY` export is needed.
+
+**Prerequisite:** the GPG agent must have the passphrase cached from a previous
+`gpg --sign` or `gpg --decrypt` in the same session. If not cached, run one
+interactive sign first (from a real TTY) to prime the agent.
